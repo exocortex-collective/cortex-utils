@@ -453,6 +453,22 @@ def test_days_sizes_the_window_and_the_chain_follows_it() -> None:
     assert _posted[0]["payload"] == {"after": "2024-10-18", "before": "2024-10-26"}
 
 
+def test_a_job_list_at_the_fetch_limit_raises_rather_than_walking_a_truncated_chain() -> None:
+    """The gateway returns the newest N jobs; a full page may hide the oldest.
+
+    A chain built from a truncated list stops short of the real frontier and
+    re-queues an already-ingested window every night, exiting 0.
+    """
+    import pytest
+
+    import cortex_utils.backfill_walker as bw
+
+    jobs = [_job("2024-12-01", "2025-01-01")] * bw.JOB_FETCH_LIMIT
+    with pytest.raises(RuntimeError, match="fetch limit"):
+        _walk_with_jobs(jobs, dry_run=True)
+    assert _posted == []
+
+
 # --- CLI option pass-through: the round 6 finding ----------------------------
 #
 # The options were parsed and never asserted on, so the wiring between click
@@ -568,6 +584,7 @@ def test_cli_defaults_match_the_walker_defaults() -> None:
     assert result.exit_code == 0, result.output
     assert captured["seed"] == bw.DEFAULT_SEED
     assert captured["floor"] == bw.DEFAULT_FLOOR
+    assert captured["days"] is None, "omitting --days must leave the month walk"
 
 
 def test_months_must_be_at_least_one() -> None:
@@ -589,15 +606,16 @@ def test_months_must_be_at_least_one() -> None:
     original = bw.walk
     bw.walk = lambda **kw: "ok"  # type: ignore[assignment]
     try:
-        for bad in ("0", "-1"):
-            result = CliRunner().invoke(
-                main, ["backfill", "walk", "--gateway", "http://gw", "--months", bad]
-            )
-            assert result.exit_code != 0, f"--months {bad} must be rejected"
-            assert "months" in result.output.lower(), (
-                f"--months {bad} must be rejected BY VALIDATION, not incidentally: "
-                f"{result.output!r}"
-            )
+        for flag in ("--months", "--days"):
+            for bad in ("0", "-1"):
+                result = CliRunner().invoke(
+                    main, ["backfill", "walk", "--gateway", "http://gw", flag, bad]
+                )
+                assert result.exit_code != 0, f"{flag} {bad} must be rejected"
+                assert flag[2:] in result.output.lower(), (
+                    f"{flag} {bad} must be rejected BY VALIDATION, not incidentally: "
+                    f"{result.output!r}"
+                )
         ok = CliRunner().invoke(
             main, ["backfill", "walk", "--gateway", "http://gw", "--months", "1"]
         )

@@ -3,7 +3,7 @@
 
 Devon's mailbox goes back to 2002; Cortex currently holds 2025-01 onward.
 Ingesting 23 years at once would hammer the Gmail API and bury the live queue,
-so this queues exactly one month-long window per run, intended nightly.
+so this queues exactly one window per run, intended nightly.
 
 WHY THE WATERMARK IS NOT `MIN(internal_date)`
 
@@ -38,6 +38,10 @@ from typing import Any
 GATEWAY_ENV = "CORTEX_GATEWAY_URL"
 DEFAULT_SEED = date(2025, 1, 1)  # bulk corpus start; older mail predates Cortex
 DEFAULT_FLOOR = date(2002, 1, 1)  # mailbox origin; nothing to find below this
+# The gateway returns the NEWEST `limit` jobs, and the watermark chain needs
+# every one back to the seed. Far above any real count (a week a night from
+# 2025 to 2002 is ~1200 jobs); walk() raises if it is ever reached.
+JOB_FETCH_LIMIT = 100_000
 
 
 def month_before(d: date, months: int = 1) -> date:
@@ -206,7 +210,7 @@ def walk(
     being unreachable, or the queue call failing.
     """
     try:
-        body = _get(f"{gateway}/sync/backfill?limit=500")
+        body = _get(f"{gateway}/sync/backfill?limit={JOB_FETCH_LIMIT}")
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise RuntimeError(f"cannot reach gateway at {gateway}: {e}") from e
 
@@ -218,6 +222,12 @@ def walk(
         raise RuntimeError(
             f"unexpected response from {gateway}/sync/backfill: "
             f"expected a 'jobs' list, got {type(jobs).__name__}"
+        )
+
+    if len(jobs) >= JOB_FETCH_LIMIT:
+        raise RuntimeError(
+            f"gateway returned {len(jobs)} backfill jobs, the fetch limit: the "
+            f"oldest may be cut off, which breaks the watermark chain"
         )
 
     # Validate shape BEFORE touching any entry. The busy filter below is the
