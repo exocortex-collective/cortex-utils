@@ -826,6 +826,12 @@ def backfill() -> None:
     help="Window size per run, in months",
 )
 @click.option(
+    "--days",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Window size per run, in days. Overrides --months.",
+)
+@click.option(
     "--seed",
     type=click.DateTime(["%Y-%m-%d"]),
     default=None,
@@ -853,13 +859,14 @@ def backfill() -> None:
 def backfill_walk(
     gateway: str,
     months: int,
+    days: int | None,
     seed: datetime | None,
     floor: datetime | None,
     overlap_days: int,
     stale_after_hours: int,
     dry_run: bool,
 ) -> None:
-    """Queue one month-window of historical ingest, walking backwards.
+    """Queue one window of historical ingest, walking backwards.
 
     Intended to run nightly. Queues at most one job per run and skips entirely
     while a previous one is still pending or running, so it cannot pile up
@@ -870,6 +877,7 @@ def backfill_walk(
             bw.walk(
                 gateway=gateway,
                 months=months,
+                days=days,
                 seed=seed.date() if seed else bw.DEFAULT_SEED,
                 floor=floor.date() if floor else bw.DEFAULT_FLOOR,
                 overlap_days=overlap_days,
