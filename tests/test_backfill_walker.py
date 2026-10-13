@@ -440,7 +440,7 @@ def test_days_sizes_the_window_and_the_chain_follows_it() -> None:
     The second walk proves the watermark chain follows day windows: the
     completed week must move the frontier, or the walker re-queues it nightly.
     """
-    msg = _walk_with_jobs([], seed=date(2024, 11, 1), days=7)
+    msg = _walk_with_jobs([], seed=date(2024, 11, 1), months=3, days=7)
     assert _posted == [
         {
             "url": "http://x/sync/backfill",
