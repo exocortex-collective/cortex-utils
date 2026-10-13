@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Walk the Gmail archive backwards one month per run.
+"""Walk the Gmail archive backwards one window (a month, or N days) per run.
 
 Devon's mailbox goes back to 2002; Cortex currently holds 2025-01 onward.
 Ingesting 23 years at once would hammer the Gmail API and bury the live queue,
@@ -22,7 +22,7 @@ inspectable (`GET /sync/backfill`) and means there is nothing extra to migrate
 or keep in sync. With no prior windowed jobs, it seeds from --seed.
 
 USAGE
-    cortex-utils backfill walk [--dry-run] [--months 1]
+    cortex-utils backfill walk [--dry-run] [--months 1 | --days 7]
 """
 
 from __future__ import annotations
@@ -189,6 +189,7 @@ def _job_age_hours(created_at: str | None) -> float | None:
 def walk(
     gateway: str,
     months: int = 1,
+    days: int | None = None,
     seed: date = DEFAULT_SEED,
     floor: date = DEFAULT_FLOOR,
     dry_run: bool = False,
@@ -196,6 +197,10 @@ def walk(
     overlap_days: int = 1,
 ) -> str:
     """Queue one window, or explain why it did not. Returns a status line.
+
+    `days`, when set, sizes the window in days instead of `months`. Day
+    windows are not aligned to month starts; the watermark chain does not
+    need them to be, since it only follows abutting completed windows.
 
     Raises RuntimeError on anything that should page a human: the gateway
     being unreachable, or the queue call failing.
@@ -272,7 +277,8 @@ def walk(
     if upper <= floor:
         return f"done: watermark {upper} has reached the floor {floor}"
 
-    lower = max(month_before(upper, months), floor)
+    step = upper - timedelta(days=days) if days else month_before(upper, months)
+    lower = max(step, floor)
 
     # Extend the window FORWARD past the seam into already-ingested days.
     # Gmail's after:/before: are date-granular and timezone-sensitive, so a

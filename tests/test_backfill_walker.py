@@ -434,6 +434,25 @@ def test_the_window_is_clamped_to_the_floor_never_crossing_it() -> None:
     assert "'after': '2002-01-01'" in msg, f"window must clamp to the floor, got {msg!r}"
 
 
+def test_days_sizes_the_window_and_the_chain_follows_it() -> None:
+    """A week window steps back 7 days from the frontier, not to a month start.
+
+    The second walk proves the watermark chain follows day windows: the
+    completed week must move the frontier, or the walker re-queues it nightly.
+    """
+    msg = _walk_with_jobs([], seed=date(2024, 11, 1), days=7)
+    assert _posted == [
+        {
+            "url": "http://x/sync/backfill",
+            "payload": {"after": "2024-10-25", "before": "2024-11-02"},
+        }
+    ], msg
+
+    done = [_job("2024-10-25", "2024-11-02")]
+    _walk_with_jobs(done, seed=date(2024, 11, 1), days=7)
+    assert _posted[0]["payload"] == {"after": "2024-10-18", "before": "2024-10-26"}
+
+
 # --- CLI option pass-through: the round 6 finding ----------------------------
 #
 # The options were parsed and never asserted on, so the wiring between click
@@ -476,6 +495,8 @@ def test_cli_options_reach_walk_unswapped() -> None:
                 "2025-06-01",
                 "--floor",
                 "2003-04-05",
+                "--days",
+                "7",
                 "--overlap-days",
                 "2",
                 "--stale-after-hours",
@@ -488,6 +509,7 @@ def test_cli_options_reach_walk_unswapped() -> None:
     assert result.exit_code == 0, result.output
     assert captured["gateway"] == "http://gw.example"
     assert captured["months"] == 3
+    assert captured["days"] == 7
     assert captured["seed"] == date(2025, 6, 1), "seed and floor must not be swapped"
     assert captured["floor"] == date(2003, 4, 5)
     assert captured["overlap_days"] == 2
