@@ -294,6 +294,7 @@ def test_future_timestamp_reports_negative_age() -> None:
 # Every _walk_with_jobs call records what walk() tried to QUEUE, so a test can
 # assert on the walker's decision rather than on an exception from the network.
 _posted: list[dict[str, object]] = []
+_fetched: list[str] = []
 
 
 def _walk_with_jobs(jobs: list[dict[str, object]], **kw: object) -> str:
@@ -311,13 +312,18 @@ def _walk_with_jobs(jobs: list[dict[str, object]], **kw: object) -> str:
     from cortex_utils.backfill_walker import walk
 
     _posted.clear()
+    _fetched.clear()
+
+    def fake_get(url: str) -> dict[str, object]:
+        _fetched.append(url)
+        return {"jobs": jobs}
 
     def fake_post(url: str, payload: dict[str, str]) -> dict[str, object]:
         _posted.append({"url": url, "payload": dict(payload)})
         return {"id": "queued-1", "status": "pending"}
 
     original_get, original_post = bw._get, bw._post
-    bw._get = lambda url: {"jobs": jobs}  # type: ignore[assignment]
+    bw._get = fake_get  # type: ignore[assignment]
     bw._post = fake_post  # type: ignore[assignment]
     try:
         # seed is a default here, not a fixed value: the floor tests need to
@@ -467,6 +473,7 @@ def test_a_job_list_at_the_fetch_limit_raises_rather_than_walking_a_truncated_ch
     with pytest.raises(RuntimeError, match="fetch limit"):
         _walk_with_jobs(jobs, dry_run=True)
     assert _posted == []
+    assert _fetched == [f"http://x/sync/backfill?limit={bw.JOB_FETCH_LIMIT}"]
 
 
 # --- CLI option pass-through: the round 6 finding ----------------------------
