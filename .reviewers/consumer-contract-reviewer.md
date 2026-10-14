@@ -2,7 +2,7 @@
 model: sonnet
 verification: evidence-query
 **Checks:** Changes to cortex-utils names, signatures, pydantic model fields and DDL that sibling services (gateway, triage, postmark) import, and imports of service code into this library.
-**Spawn when:** diff renames, removes or changes the signature/default of a public name in `src/cortex_utils/` (`__init__.py` exports, `triage_config/models.py`, `queue/` public functions, `cli.py` commands), changes a pydantic model field or a table/column used by consumers, or adds an import of `triage`, `postmark` or `gateway`; skip otherwise.
+**Spawn when:** diff renames, removes or changes the signature/default of a public name in `src/cortex_utils/` (a subpackage `__init__.py` or `__all__` export, `triage_config/models.py`, `queue/` public functions, `cli.py` commands), changes a pydantic model field or a table/column used by consumers, or adds an import of `triage`, `postmark` or `gateway`; skip otherwise.
 
 **Proof:** greps this repo for the changed name, and the diff for the consumers' documented import sites; consumer breakage that cannot be shown from the diff is labelled judgement.
 

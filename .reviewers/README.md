@@ -1,30 +1,14 @@
-# Guidelines
+# Reviewer pack
 
-A reviewer pack for Python projects. Each section below is an independent reviewer prompt with its own scope, set of patterns to flag, and disposition.
+A reviewer pack for Python projects. Each file in this directory is an independent reviewer prompt with its own scope, set of patterns to flag, and disposition.
 
 ## How the pack runs
 
-**This file is consumed BY the `pr-review-loop` skill — do not run these reviewers directly.** If you've read this file and are about to spawn the agents yourself (outside the skill), stop and invoke `pr-review-loop` instead: the skill owns the parts this file doesn't define — agents posting findings as PR line comments, independent validation of posted findings, per-thread replies, per-agent retirement, CI gating, and exit conditions. Hand-spawning from this file skips all of that and breaks the PR audit trail.
+**These files are consumed BY the `pr-review-loop` skill — do not run these reviewers directly.** If you are about to spawn the agents yourself (outside the skill), stop and invoke `pr-review-loop` instead: the skill owns the parts these files don't define — agents posting findings as PR line comments, independent validation of posted findings, per-thread replies, per-agent retirement, CI gating, and exit conditions. Hand-spawning skips all of that and breaks the PR audit trail.
 
 Each reviewer runs independently and reports findings without coordination. A reviewer's silence on something is not an endorsement — it just means that reviewer didn't see anything in its scope.
 
-**Per-reviewer file scope:**
-
-| Reviewer | Files in scope |
-|----------|----------------|
-| `test-coverage-reviewer` | `*.py` |
-| `error-handling-reviewer` | `*.py` (production code) |
-| `logging-reviewer` | `*.py` (rules differ for CLI entry points vs libraries/services) |
-| `complexity-reviewer` | `*.py` (skips `tests/`) |
-| `concurrency-reviewer` | `*.py` touching `threading`, `multiprocessing`, `asyncio`, `concurrent.futures`, or `queue` |
-| `resource-leak-reviewer` | `*.py` |
-| `external-process-reviewer` | `*.py` touching `subprocess`, `os.system`, `shutil.which` |
-| `dead-code-reviewer` | `*.py` |
-| `import-reviewer` | `*.py` |
-| `importlib-resources-reviewer` | `*.py` in packaged modules (skips `tests/` and ad-hoc scripts) |
-| `dataclass-decorator-reviewer` | `*.py` using `dataclasses.field` |
-| `typing-consistency-reviewer` | `*.py` files that already use type annotations |
-| `clarity-reviewer` | `*.md`, `*.py` (docstrings and comments) |
+Each reviewer's `**Spawn when:**` header is authoritative for its scope.
 
 Skip reviewers whose file scope doesn't match the PR diff.
 
@@ -112,5 +96,3 @@ To defer a P2 or P3 finding to a follow-up:
 3. The reviewer accepts the deferral only when the beads ticket exists.
 
 **P1 findings are not deferrable** — they must be fixed in-PR.
-
----

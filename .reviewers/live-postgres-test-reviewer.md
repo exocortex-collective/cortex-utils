@@ -6,14 +6,14 @@ verification: mutation
 
 **Proof:** flips one clause of the SQL under review in a scratch copy (never the working tree) and runs the `*_live.py` tests against CORTEX_TEST_DSN; a mutant that survives is the finding.
 
-CI runs a `postgres:16` service and fails if live tests skipped; the defects this suite exists to catch (partition coverage, EXTRACT returning numeric, an inverted FILTER) are invisible to a mock, which returns whatever the code asked for.
+CI runs a `postgres:16` service and fails if the live-test files listed in the `ci.yml` skip-guard step are skipped; the defects this suite exists to catch (partition coverage, EXTRACT returning numeric, an inverted FILTER) are invisible to a mock, which returns whatever the code asked for.
 
 **What to flag:**
 
 1. A changed or new SQL clause (WHERE, FILTER, ON CONFLICT, ORDER BY, LIMIT, partition predicate) whose only tests assert on a MagicMock cursor's `execute` call text. Prove it: mutate the clause in a scratch copy, run `uv run pytest -q tests`; if the count of passing tests is unchanged, flag.
 2. A new `tests/test_*_live.py` or live test function without the module's `pytest.mark.skipif(not DSN, ...)` gate, or using a DSN other than `CORTEX_TEST_DSN`.
 3. A live test that creates objects in a shared schema without cleanup, or depends on another test's rows.
-4. A live-test conversion that changes CI's skip-detection step so skipped tests pass silently.
+4. A change to CI's skip-detection step that lets skipped tests pass silently, or a new `tests/test_*_live.py` not added to that step's file list in `.github/workflows/ci.yml`.
 
 **Do NOT flag:**
 - Pure-Python logic with no SQL (mocks are fine).
