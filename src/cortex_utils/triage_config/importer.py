@@ -286,6 +286,7 @@ def import_yaml_to_db(
     yaml_content: str,
     created_by: str,
     notes: str | None = None,
+    activate: bool = True,
 ) -> int:
     """Import YAML config to database, creating new version.
 
@@ -294,6 +295,8 @@ def import_yaml_to_db(
         yaml_content: YAML config content
         created_by: User/system creating this version
         notes: Optional notes about this version
+        activate: False stages the version: stored inactive, and the global
+            email mappings are left alone, so staging changes nothing live.
 
     Returns:
         New version number
@@ -314,9 +317,14 @@ def import_yaml_to_db(
         config_hash = hashlib.sha256(yaml_content.encode()).hexdigest()
 
         # 3. Check for duplicate
+        # Activating, only an identical ACTIVE version makes this a no-op: an
+        # identical staged or superseded one must still become the new active
+        # version, or the caller is told "done" for a config that is not live.
         cursor.execute(
-            "SELECT version FROM triage_config_versions WHERE config_hash = %s",
-            (config_hash,),
+            "SELECT version FROM triage_config_versions"
+            " WHERE config_hash = %s AND (is_active OR NOT %s)"
+            " ORDER BY version DESC LIMIT 1",
+            (config_hash, activate),
         )
         existing = cursor.fetchone()
         if existing:
@@ -362,7 +370,7 @@ def import_yaml_to_db(
             (
                 created_by,
                 notes,
-                True,  # Auto-deactivates old version via trigger
+                activate,  # True auto-deactivates the old version via trigger
                 config_hash,
                 config.label_prefix,
                 config.default_label,
@@ -482,24 +490,16 @@ def import_yaml_to_db(
                 deleted_at = NULL
         """
 
-        for email, action_config in config.priority_email_mappings.items():
+        # The mappings table is global and live: a staged version must not touch it.
+        mappings = [
+            *(("priority", m) for m in config.priority_email_mappings.items()),
+            *(("fallback", m) for m in config.fallback_email_mappings.items()),
+        ]
+        for mapping_type, (email, action_config) in mappings if activate else []:
             cursor.execute(
                 upsert_sql,
                 (
-                    "priority",
-                    email.lower(),
-                    action_config.label,
-                    action_config.archive,
-                    action_config.mark_read,
-                    created_by,
-                ),
-            )
-
-        for email, action_config in config.fallback_email_mappings.items():
-            cursor.execute(
-                upsert_sql,
-                (
-                    "fallback",
+                    mapping_type,
                     email.lower(),
                     action_config.label,
                     action_config.archive,
