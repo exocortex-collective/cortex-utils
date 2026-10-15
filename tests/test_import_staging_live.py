@@ -146,3 +146,15 @@ def test_concurrent_identical_imports_create_one_version(conn: Any) -> None:
         t.join()
     assert len(set(results)) == 1 and isinstance(results[0], int), results
     assert len(_versions(conn)) == 2
+
+
+def test_a_duplicate_import_releases_the_import_lock(conn: Any) -> None:
+    first = import_yaml_to_db(conn, _config("Live"), "test")
+    assert import_yaml_to_db(conn, _config("Live"), "test") == first
+    other = psycopg2.connect(DSN)
+    try:
+        with other.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('triage_config_import'))")
+            assert cur.fetchone()[0] is True
+    finally:
+        other.close()
