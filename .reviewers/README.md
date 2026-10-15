@@ -69,7 +69,7 @@ Reason (optional): <only if not obvious>
 Example:
 
 ```
-[concurrency-reviewer] [P1] Lock held across a network call
+[concurrency-reviewer] [P2] Lock held across a network call
 
 File: cache/store.py:24
 Quote:
@@ -78,7 +78,8 @@ Quote:
             self._data[key] = requests.get(url, timeout=30).json()
 
 Issue: Every thread calling get() waits behind one HTTP request, up to 30s each.
-Suggested fix: Fetch outside the lock, then take the lock only to store the result.
+Suggested fix: Fetch outside the lock, then store with self._data.setdefault(key, value)
+under the lock so a concurrent fetch cannot overwrite it.
 ```
 
 Structured findings are diff-able, easy to triage, and easy to deduplicate when multiple reviewers flag the same line.

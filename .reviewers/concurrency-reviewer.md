@@ -8,12 +8,12 @@ Review Python code for **concurrency correctness**: threads, processes, asyncio,
 **Locks.** A `threading.Lock` guarding shared mutable state is ordinary Python. Do not flag a lock for existing, and do not ask for it to be replaced with a queue or a process boundary. Flag lock *misuse*:
 
 - shared mutable state written from more than one thread with no synchronization at all (see #6);
-- a lock held across blocking I/O, a network or database call, or a `sleep`, which serializes every caller behind the slowest one;
+- a lock held across blocking I/O or a `sleep`, which serializes every caller behind the slowest one;
 - two locks acquired in different orders on different paths (deadlock);
 - the guarded state read or written outside the lock, or a check-then-act split across two acquisitions;
-- a `threading.Lock` acquired inside `async def`, which blocks the event loop (use `asyncio.Lock`).
+- a `threading.Lock` held across an `await`: another coroutine on the same loop that tries to acquire it deadlocks the loop.
 
-Severity follows the failure: a race or deadlock you can show is P1; a lock that merely looks heavier than needed is not a finding.
+Severity follows the failure: a race or deadlock you can show is P1, other misuse is P2, and a lock that merely looks heavier than needed is not a finding.
 
 **Other patterns to FLAG:**
 
