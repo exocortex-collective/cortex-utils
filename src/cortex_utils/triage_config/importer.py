@@ -317,6 +317,11 @@ def import_yaml_to_db(
         config_hash = hashlib.sha256(yaml_content.encode()).hexdigest()
 
         # 3. Check for duplicate
+        # Serialise imports to end of transaction. Without it two concurrent
+        # imports both pass the duplicate check below, and both take
+        # MAX(version)+1 in the version trigger, one failing on the unique key.
+        cursor.execute("SELECT pg_advisory_xact_lock(hashtext('triage_config_import'))")
+
         # Activating, only an identical ACTIVE version makes this a no-op: an
         # identical staged or superseded one must still become the new active
         # version, or the caller is told "done" for a config that is not live.
@@ -332,6 +337,7 @@ def import_yaml_to_db(
             logger.info(
                 f"Config already exists as version {version_num} (hash: {config_hash[:8]}...)"
             )
+            conn.commit()  # releases the import lock
             return version_num
 
         # 4. Create new version (transaction)
@@ -491,11 +497,15 @@ def import_yaml_to_db(
         """
 
         # The mappings table is global and live: a staged version must not touch it.
-        mappings = [
-            *(("priority", m) for m in config.priority_email_mappings.items()),
-            *(("fallback", m) for m in config.fallback_email_mappings.items()),
-        ]
-        for mapping_type, (email, action_config) in mappings if activate else []:
+        mappings = (
+            [
+                *(("priority", m) for m in config.priority_email_mappings.items()),
+                *(("fallback", m) for m in config.fallback_email_mappings.items()),
+            ]
+            if activate
+            else []
+        )
+        for mapping_type, (email, action_config) in mappings:
             cursor.execute(
                 upsert_sql,
                 (
