@@ -32,13 +32,14 @@ Every finding must be tagged with a beads-style priority:
 
 | Priority | Disposition | Examples |
 |----------|-------------|----------|
-| **P1** | Blocking — must fix before merge | Silent exception swallow, new `threading.Lock` without justification, missing `@dataclass` on a class using `field()`, leaked DB connection, command injection via `shell=True` |
+| **P1** | Blocking — must fix before merge | Silent exception swallow, unsynchronized write to state shared across threads, missing `@dataclass` on a class using `field()`, leaked DB connection, command injection via `shell=True` |
 | **P2** | Should fix in this PR | Missing `raise ... from`, missing `subprocess` timeout, missing tests for new branches, mccabe complexity floor violation, function-level import |
 | **P3** | Advisory — deferrable with a beads ticket | Complexity heuristic findings, dead code, clarity nits, markdown structural suggestions |
 
 **Default severity per reviewer:**
 
-- `concurrency-reviewer`, `resource-leak-reviewer`: **P1** by default.
+- `resource-leak-reviewer`: **P1** by default.
+- `concurrency-reviewer`: **P1** for a race or deadlock it can show; otherwise **P2**.
 - `error-handling-reviewer`: **P2** by default; **P1** for silent exception swallows and `return` in `finally`.
 - `logging-reviewer`: **P2** by default; **P1** for sensitive data in log messages.
 - `dataclass-decorator-reviewer`: **P1** by default (it's a correctness bug that escapes type checkers).
@@ -68,21 +69,17 @@ Reason (optional): <only if not obvious>
 Example:
 
 ```
-[concurrency-reviewer] [P1] New threading.Lock without justification
+[concurrency-reviewer] [P2] Lock held across a network call
 
-File: cache/store.py:18
+File: cache/store.py:24
 Quote:
-    class Cache:
-        def __init__(self):
-            self._lock = threading.Lock()
-            self._data: dict[str, Any] = {}
+    with self._lock:
+        if key not in self._data:
+            self._data[key] = requests.get(url, timeout=30).json()
 
-Issue: New threading.Lock protects mutable shared state. Per the pack's design
-philosophy, threading locks are flagged by default — move the data into a worker
-process behind a queue, or into an asyncio task that owns the state, unless this
-falls into "Tolerated uses" in concurrency-reviewer.
-Suggested fix: Use multiprocessing.Process + queue.Queue for cross-process shared
-state, or an asyncio task that owns the dict and exposes async methods.
+Issue: Every thread calling get() waits behind one HTTP request, up to 30s each.
+Suggested fix: Fetch outside the lock, then store with self._data.setdefault(key, value)
+under the lock so a concurrent fetch cannot overwrite it.
 ```
 
 Structured findings are diff-able, easy to triage, and easy to deduplicate when multiple reviewers flag the same line.
