@@ -420,6 +420,7 @@ class Action(BaseModel):
     - force_mark_read: Force mark-read regardless of other chains.
     - force_no_star: Force no star regardless of other chains.
     - force_no_important: Force not important regardless of other chains.
+    - trash: Move to Gmail Trash if any chain says so. Never undone by triage.
     """
 
     label: str | None = None  # Auto-prefixed with label_prefix
@@ -433,6 +434,7 @@ class Action(BaseModel):
     force_mark_read: bool | None = None
     force_no_star: bool | None = None
     force_no_important: bool | None = None
+    trash: bool | None = None
 
 
 class EmailMappingAction(BaseModel):
