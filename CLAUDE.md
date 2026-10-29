@@ -57,8 +57,10 @@ uv run pytest
 1. Create a feature branch
 2. Make changes and commit
 3. Push the branch and create a PR
-4. Wait for CI and Gemini Code Assist review
-5. Merge via GitHub after approval
+4. Wait for CI; run pr-review-loop (Gemini is disabled in
+   `.reviewers/config.json`)
+5. Merge once the pr-review-loop converges (one clean round) or Devon
+   says yes
 
 This applies to all changes, no matter how small.
 
