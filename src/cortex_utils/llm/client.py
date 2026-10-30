@@ -43,10 +43,9 @@ class LLMTruncatedError(LLMError):
     The escape is to change an input -- a larger budget, a different model,
     think=False -- not to repeat the call.
 
-    An earlier version argued this from "at temperature 0 a retry is
-    deterministic". That premise does not hold here: only check_intent passes
-    temperature=0, and check_email_intent carries a comment explicitly refusing
-    it because some models return empty content at 0.
+    Do not reason about this from temperature: only check_intent passes
+    temperature=0, and check_email_intent explicitly refuses it, because some
+    models return empty content at 0.
     """
 
     retryable: bool = False
@@ -271,12 +270,12 @@ class LLMClient:
 
         Where that lands, traced 2026-10-07 rather than assumed:
 
-            triage/engine/matcher.py:1301  unpacks the tuple
-            matcher.py:1307                `if category in rule.routes`
-            rule.routes                    dict[str, Action]
+            triage/engine/matcher.py   unpacks the tuple, then
+                                       `if category in rule.routes`
+            rule.routes                dict[str, Action]
             -> TypeError: unhashable type: 'list'
 
-        The nearest handler is `except VariableError` at matcher.py:1227,
+        The nearest handler is matcher.py's `except VariableError`,
         which does not catch it, so it reaches the worker's broad
         `except Exception` -> _fail_job -> three attempts -> dead letter. The
         intended refusal (category not in routes, fall through to the next

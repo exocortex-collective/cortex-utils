@@ -6,7 +6,7 @@ shape errors were already loud; those three defaults were not. Two of them are
 now required -- `category` and `confidence`. `reasoning` still defaults, which
 test_a_null_reasoning_is_coerced_not_raised pins deliberately.
 
-The consumer is triage's matcher (matcher.py:1292, :1301) -- the only caller of
+The consumer is triage's `engine/matcher.py` -- the only caller of
 classify/classify_with_extraction in the estate. It does not threshold the
 confidence, it records it, so the damage is a fabricated row rather than a
 wrong branch. reflex parses its own JSON and has its own guards.
@@ -102,7 +102,7 @@ def _client_returning(body: dict, native_body: dict | None = None) -> LLMClient:
     c = LLMClient("http://llm.test")
     calls: list[dict] = []
 
-    def post(url, json=None, **kw):
+    def post(url: str, json: dict | None = None, **kw: object) -> httpx.Response:
         calls.append({"url": url, "json": json})
         payload = native_body if url.endswith("/api/generate") and native_body else body
         return httpx.Response(200, json=payload, request=httpx.Request("POST", url))
@@ -410,11 +410,11 @@ class TestTheReturnTypeIsEnforcedNotJustAnnotated:
     the client raises would leave the reason unstated, and the reason is that
     the consumer's membership test is what actually blows up:
 
-        triage/engine/matcher.py:1307   `if category in rule.routes`
-        rule.routes                     dict[str, Action]
+        triage/engine/matcher.py   `if category in rule.routes`
+        rule.routes                dict[str, Action]
         -> TypeError: unhashable type: 'list'
 
-    past `except VariableError` (matcher.py:1227) to the worker's broad
+    past matcher.py's `except VariableError` to the worker's broad
     `except Exception` -> three attempts -> dead letter. The email is never
     classified, so it is never labelled, so the workflow never dispatches.
     """
