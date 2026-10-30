@@ -20,7 +20,7 @@ class LLMError(Exception):
     """Raised when LLM call fails (network, HTTP, or invalid response)."""
 
     # Whether repeating the identical call could plausibly succeed.
-    retryable = True
+    retryable: bool = True
 
 
 class LLMTruncatedError(LLMError):
@@ -49,7 +49,7 @@ class LLMTruncatedError(LLMError):
     it because some models return empty content at 0.
     """
 
-    retryable = False
+    retryable: bool = False
 
 
 # Max characters of email body to include in LLM prompts
@@ -220,7 +220,6 @@ class LLMClient:
             )
             native_response.raise_for_status()
             native_result = native_response.json()
-            # Wrap in chat completions format for consistent handling
             result = {
                 "choices": [
                     {

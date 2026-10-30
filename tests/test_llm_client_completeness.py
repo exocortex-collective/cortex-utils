@@ -2,7 +2,9 @@
 
 The client read every field of the parsed JSON with a default, so a truncated
 response produced a well-formed, plausible result: ("unknown", 0.5, ""). The
-shape errors were already loud; these three fields were not.
+shape errors were already loud; those three defaults were not. Two of them are
+now required -- `category` and `confidence`. `reasoning` still defaults, which
+test_a_null_reasoning_is_coerced_not_raised pins deliberately.
 
 The consumer is triage's matcher (matcher.py:1292, :1301) -- the only caller of
 classify/classify_with_extraction in the estate. It does not threshold the
@@ -18,7 +20,9 @@ in the foodcam project, not re-measured here.
 from __future__ import annotations
 
 import json
+from unittest import mock
 
+import httpx
 import pytest
 
 from cortex_utils.llm.client import LLMClient, LLMError, LLMTruncatedError
@@ -88,19 +92,13 @@ class TestAMissingFieldIsNotAnAnswer:
         assert LLMClient._required({"category": value}, "category") == value
 
 
-def _client_returning(body, native_body=None):
+def _client_returning(body: dict, native_body: dict | None = None) -> LLMClient:
     """A real LLMClient whose HTTP layer returns `body`.
 
     Drives the actual public method rather than the helper, because a correct
     helper is worthless if the call site stops calling it -- three mutants that
     reverted the call sites survived a suite that tested only the helpers.
     """
-    from unittest import mock
-
-    import httpx
-
-    from cortex_utils.llm.client import LLMClient
-
     c = LLMClient("http://llm.test")
     calls: list[dict] = []
 
@@ -115,7 +113,7 @@ def _client_returning(body, native_body=None):
     return c
 
 
-def _wrap(content):
+def _wrap(content: str) -> dict:
     return {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
 
 
@@ -236,6 +234,14 @@ class TestTheOtherCallSiteRefusesToo:
         del full[missing]
         c = _client_returning(_wrap(json.dumps(full)))
         with pytest.raises(LLMError, match=f"has no {missing!r}"):
+            c.classify_with_extraction("prompt", "some-model", ["amount"])
+
+    def test_it_refuses_a_non_numeric_confidence(self):
+        """The sibling of the classify() case, on the path triage actually takes."""
+        c = _client_returning(
+            _wrap(json.dumps({"category": "admin", "confidence": "high", "reasoning": "r"}))
+        )
+        with pytest.raises(LLMError, match="confidence"):
             c.classify_with_extraction("prompt", "some-model", ["amount"])
 
     def test_it_accepts_a_complete_response_and_strips_extracted(self):
