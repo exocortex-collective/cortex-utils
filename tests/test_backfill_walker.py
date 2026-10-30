@@ -294,6 +294,7 @@ def test_future_timestamp_reports_negative_age() -> None:
 # Every _walk_with_jobs call records what walk() tried to QUEUE, so a test can
 # assert on the walker's decision rather than on an exception from the network.
 _posted: list[dict[str, object]] = []
+_fetched: list[str] = []
 
 
 def _walk_with_jobs(jobs: list[dict[str, object]], **kw: object) -> str:
@@ -311,13 +312,18 @@ def _walk_with_jobs(jobs: list[dict[str, object]], **kw: object) -> str:
     from cortex_utils.backfill_walker import walk
 
     _posted.clear()
+    _fetched.clear()
+
+    def fake_get(url: str) -> dict[str, object]:
+        _fetched.append(url)
+        return {"jobs": jobs}
 
     def fake_post(url: str, payload: dict[str, str]) -> dict[str, object]:
         _posted.append({"url": url, "payload": dict(payload)})
         return {"id": "queued-1", "status": "pending"}
 
     original_get, original_post = bw._get, bw._post
-    bw._get = lambda url: {"jobs": jobs}  # type: ignore[assignment]
+    bw._get = fake_get  # type: ignore[assignment]
     bw._post = fake_post  # type: ignore[assignment]
     try:
         # seed is a default here, not a fixed value: the floor tests need to
@@ -434,6 +440,42 @@ def test_the_window_is_clamped_to_the_floor_never_crossing_it() -> None:
     assert "'after': '2002-01-01'" in msg, f"window must clamp to the floor, got {msg!r}"
 
 
+def test_days_sizes_the_window_and_the_chain_follows_it() -> None:
+    """A week window steps back 7 days from the frontier, not to a month start.
+
+    The second walk proves the watermark chain follows day windows: the
+    completed week must move the frontier, or the walker re-queues it nightly.
+    """
+    msg = _walk_with_jobs([], seed=date(2024, 11, 1), months=3, days=7)
+    assert _posted == [
+        {
+            "url": "http://x/sync/backfill",
+            "payload": {"after": "2024-10-25", "before": "2024-11-02"},
+        }
+    ], msg
+
+    done = [_job("2024-10-25", "2024-11-02")]
+    _walk_with_jobs(done, seed=date(2024, 11, 1), days=7)
+    assert _posted[0]["payload"] == {"after": "2024-10-18", "before": "2024-10-26"}
+
+
+def test_a_job_list_at_the_fetch_limit_raises_rather_than_walking_a_truncated_chain() -> None:
+    """The gateway returns the newest N jobs; a full page may hide the oldest.
+
+    A chain built from a truncated list stops short of the real frontier and
+    re-queues an already-ingested window every night, exiting 0.
+    """
+    import pytest
+
+    import cortex_utils.backfill_walker as bw
+
+    jobs = [_job("2024-12-01", "2025-01-01")] * bw.JOB_FETCH_LIMIT
+    with pytest.raises(RuntimeError, match="fetch limit"):
+        _walk_with_jobs(jobs, dry_run=True)
+    assert _posted == []
+    assert _fetched == [f"http://x/sync/backfill?limit={bw.JOB_FETCH_LIMIT}"]
+
+
 # --- CLI option pass-through: the round 6 finding ----------------------------
 #
 # The options were parsed and never asserted on, so the wiring between click
@@ -476,6 +518,8 @@ def test_cli_options_reach_walk_unswapped() -> None:
                 "2025-06-01",
                 "--floor",
                 "2003-04-05",
+                "--days",
+                "7",
                 "--overlap-days",
                 "2",
                 "--stale-after-hours",
@@ -488,6 +532,7 @@ def test_cli_options_reach_walk_unswapped() -> None:
     assert result.exit_code == 0, result.output
     assert captured["gateway"] == "http://gw.example"
     assert captured["months"] == 3
+    assert captured["days"] == 7
     assert captured["seed"] == date(2025, 6, 1), "seed and floor must not be swapped"
     assert captured["floor"] == date(2003, 4, 5)
     assert captured["overlap_days"] == 2
@@ -546,6 +591,7 @@ def test_cli_defaults_match_the_walker_defaults() -> None:
     assert result.exit_code == 0, result.output
     assert captured["seed"] == bw.DEFAULT_SEED
     assert captured["floor"] == bw.DEFAULT_FLOOR
+    assert captured["days"] is None, "omitting --days must leave the month walk"
 
 
 def test_months_must_be_at_least_one() -> None:
@@ -567,15 +613,16 @@ def test_months_must_be_at_least_one() -> None:
     original = bw.walk
     bw.walk = lambda **kw: "ok"  # type: ignore[assignment]
     try:
-        for bad in ("0", "-1"):
-            result = CliRunner().invoke(
-                main, ["backfill", "walk", "--gateway", "http://gw", "--months", bad]
-            )
-            assert result.exit_code != 0, f"--months {bad} must be rejected"
-            assert "months" in result.output.lower(), (
-                f"--months {bad} must be rejected BY VALIDATION, not incidentally: "
-                f"{result.output!r}"
-            )
+        for flag in ("--months", "--days"):
+            for bad in ("0", "-1"):
+                result = CliRunner().invoke(
+                    main, ["backfill", "walk", "--gateway", "http://gw", flag, bad]
+                )
+                assert result.exit_code != 0, f"{flag} {bad} must be rejected"
+                assert flag[2:] in result.output.lower(), (
+                    f"{flag} {bad} must be rejected BY VALIDATION, not incidentally: "
+                    f"{result.output!r}"
+                )
         ok = CliRunner().invoke(
             main, ["backfill", "walk", "--gateway", "http://gw", "--months", "1"]
         )

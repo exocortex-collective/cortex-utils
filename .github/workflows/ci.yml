@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   lint-test:
@@ -66,7 +67,7 @@ jobs:
         run: |
           uv run pytest tests/test_inspect_live.py tests/test_ops_live.py \
             tests/test_dead_letter_live.py tests/test_claim_token_guard_live.py \
-            tests/test_schema_live.py \
+            tests/test_schema_live.py tests/test_import_staging_live.py \
             -q --no-header -p no:cacheprovider -p no:skipping
 
   build:
@@ -75,23 +76,22 @@ jobs:
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
-      id-token: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          workload_identity_provider: projects/63779650346/locations/global/workloadIdentityPools/github-actions/providers/github-provider
-          service_account: github-actions@cortex-gmail.iam.gserviceaccount.com
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
+        env:
+          IMAGE_NAME: ghcr.io/exocortex-collective/utils
         run: |
-          docker build -t us-central1-docker.pkg.dev/cortex-gmail/cortex/utils:${{ github.sha }} .
-          docker build -t us-central1-docker.pkg.dev/cortex-gmail/cortex/utils:latest .
-          docker push us-central1-docker.pkg.dev/cortex-gmail/cortex/utils:${{ github.sha }}
-          docker push us-central1-docker.pkg.dev/cortex-gmail/cortex/utils:latest
+          docker build --label org.opencontainers.image.source=https://github.com/${{ github.repository }} -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
+          docker push $IMAGE_NAME:${{ github.sha }}
+          docker push $IMAGE_NAME:latest

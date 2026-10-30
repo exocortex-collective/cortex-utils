@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Walk the Gmail archive backwards one month per run.
+"""Walk the Gmail archive backwards one window (a month, or N days) per run.
 
 Devon's mailbox goes back to 2002; Cortex currently holds 2025-01 onward.
 Ingesting 23 years at once would hammer the Gmail API and bury the live queue,
-so this queues exactly one month-long window per run, intended nightly.
+so this queues exactly one window per run, intended nightly.
 
 WHY THE WATERMARK IS NOT `MIN(internal_date)`
 
@@ -22,7 +22,7 @@ inspectable (`GET /sync/backfill`) and means there is nothing extra to migrate
 or keep in sync. With no prior windowed jobs, it seeds from --seed.
 
 USAGE
-    cortex-utils backfill walk [--dry-run] [--months 1]
+    cortex-utils backfill walk [--dry-run] [--months 1 | --days 7]
 """
 
 from __future__ import annotations
@@ -38,6 +38,10 @@ from typing import Any
 GATEWAY_ENV = "CORTEX_GATEWAY_URL"
 DEFAULT_SEED = date(2025, 1, 1)  # bulk corpus start; older mail predates Cortex
 DEFAULT_FLOOR = date(2002, 1, 1)  # mailbox origin; nothing to find below this
+# The gateway returns the NEWEST `limit` jobs, and the watermark chain needs
+# every one back to the seed. Far above any real count (a week a night from
+# 2025 to 2002 is ~1200 jobs); walk() raises if it is ever reached.
+JOB_FETCH_LIMIT = 100_000
 
 
 def month_before(d: date, months: int = 1) -> date:
@@ -189,6 +193,7 @@ def _job_age_hours(created_at: str | None) -> float | None:
 def walk(
     gateway: str,
     months: int = 1,
+    days: int | None = None,
     seed: date = DEFAULT_SEED,
     floor: date = DEFAULT_FLOOR,
     dry_run: bool = False,
@@ -197,11 +202,15 @@ def walk(
 ) -> str:
     """Queue one window, or explain why it did not. Returns a status line.
 
+    `days`, when set, sizes the window in days instead of `months`. Day
+    windows are not aligned to month starts; the watermark chain does not
+    need them to be, since it only follows abutting completed windows.
+
     Raises RuntimeError on anything that should page a human: the gateway
     being unreachable, or the queue call failing.
     """
     try:
-        body = _get(f"{gateway}/sync/backfill?limit=500")
+        body = _get(f"{gateway}/sync/backfill?limit={JOB_FETCH_LIMIT}")
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise RuntimeError(f"cannot reach gateway at {gateway}: {e}") from e
 
@@ -213,6 +222,12 @@ def walk(
         raise RuntimeError(
             f"unexpected response from {gateway}/sync/backfill: "
             f"expected a 'jobs' list, got {type(jobs).__name__}"
+        )
+
+    if len(jobs) >= JOB_FETCH_LIMIT:
+        raise RuntimeError(
+            f"gateway returned {len(jobs)} backfill jobs, the fetch limit: the "
+            f"oldest may be cut off, which breaks the watermark chain"
         )
 
     # Validate shape BEFORE touching any entry. The busy filter below is the
@@ -272,7 +287,8 @@ def walk(
     if upper <= floor:
         return f"done: watermark {upper} has reached the floor {floor}"
 
-    lower = max(month_before(upper, months), floor)
+    step = upper - timedelta(days=days) if days else month_before(upper, months)
+    lower = max(step, floor)
 
     # Extend the window FORWARD past the seam into already-ingested days.
     # Gmail's after:/before: are date-granular and timezone-sensitive, so a
