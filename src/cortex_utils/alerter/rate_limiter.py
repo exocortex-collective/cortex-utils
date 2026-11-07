@@ -19,8 +19,7 @@ class Run:
     """One unbroken stretch of the same error_key firing.
 
     `escalated` is what makes one outage ping ONCE. Forgetting the run instead
-    re-escalates every escalate_after_minutes for as long as the outage lasts:
-    measured at 3 pings in 12 occurrences, hundreds over a multi-day outage.
+    re-escalates every escalate_after_minutes for as long as the outage lasts.
     """
 
     started: datetime

@@ -128,7 +128,7 @@ class AlerterDaemon:
         """Process a single log line and send alerts if needed."""
 
         def send(title: str, description: str, color: int, log_limit: int, ping: bool) -> None:
-            """The one shape every alert embed has; three copies lived here."""
+            """The one shape every alert embed has."""
             self.discord.send_embed(
                 title=title,
                 description=description,
@@ -200,8 +200,7 @@ class AlerterDaemon:
                         500,
                         self.ping_critical,
                     )
-                    # Once per outage. The run keeps accumulating and the HIGH
-                    # alerts keep posting, so the outage stays visible.
+                    # Once per outage; see mark_escalated.
                     self.rate_limiter.mark_escalated(classification.error_key)
                 elif self.rate_limiter.should_alert(
                     classification.error_key, classification.cooldown_minutes

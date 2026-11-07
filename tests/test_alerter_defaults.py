@@ -1168,17 +1168,14 @@ class TestSustainedErrorsEscalate:
         assert run.started == t0
 
     def test_the_cooldown_does_not_hide_occurrences_from_the_run(self):
-        """The load-bearing one. note_occurrence is called on every line,
-        including the ones should_alert then suppresses -- those suppressed
-        lines ARE the evidence of a sustained outage."""
+        """A long run accumulates every occurrence, which is what makes it
+        distinguishable from a blip."""
         from datetime import datetime, timedelta
 
         from cortex_utils.alerter.rate_limiter import RateLimiter, is_sustained
 
         rl = RateLimiter()
         t0 = datetime(2026, 7, 24, 15, 20, 0)
-        # Ten occurrences over five hours; a 10-minute cooldown would suppress
-        # most of them from being POSTED.
         for i in range(10):
             run = rl.note_occurrence(
                 "LLM Error", now=t0 + timedelta(minutes=30 * i), run_gap_minutes=60
@@ -1192,7 +1189,7 @@ class TestSustainedErrorsEscalate:
         The deployed alerter passes neither flag, so whatever these say is what
         production does. A 300-minute default means a 5-hour outage still has
         not pinged; a 30-occurrence default means a service failing slowly
-        never escalates at all. Both stayed green before this test.
+        never escalates at all.
         """
         from cortex_utils.alerter.rate_limiter import (
             DEFAULT_ESCALATE_AFTER_MINUTES,
@@ -1228,8 +1225,7 @@ class TestSustainedErrorsEscalate:
         assert over.count == 1, "one minute past the limit starts a new run"
 
     def test_the_default_run_gap_is_used_when_none_is_passed(self):
-        """Every other test passes run_gap_minutes explicitly, so the default
-        itself was never exercised -- a default of 1 or 100000 stayed green."""
+        """Exercises the default itself, which every other test overrides."""
         from datetime import datetime, timedelta
 
         from cortex_utils.alerter.rate_limiter import (
@@ -1273,6 +1269,29 @@ class TestSustainedErrorsEscalate:
             run = rl.note_occurrence("k", now=t0 + timedelta(minutes=15 * i), run_gap_minutes=60)
             assert run.escalated is True
             assert is_sustained(run, t0 + timedelta(minutes=15 * i), 30, 3) is False
+
+    def test_marking_escalated_preserves_the_run(self):
+        """It sets one flag and changes nothing else.
+
+        `started` feeds the "failing for N minutes" line in the alert and
+        `count` the occurrence count, so resetting either would misreport the
+        outage. Nothing reads them after escalation today, which is why this
+        was unpinned.
+        """
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import RateLimiter
+
+        rl = RateLimiter()
+        t0 = datetime(2026, 7, 24, 15, 20, 0)
+        for i in range(4):
+            before = rl.note_occurrence("k", now=t0 + timedelta(minutes=15 * i))
+        rl.mark_escalated("k")
+        after = rl.runs["k"]
+        assert after.started == before.started
+        assert after.last == before.last
+        assert after.count == before.count
+        assert after.escalated is True
 
     def test_a_new_run_after_a_quiet_gap_can_escalate_again(self):
         """A genuinely new outage is a new event and must ping."""
@@ -1367,12 +1386,10 @@ class _Clock:
 
 
 class TestTheDaemonIsWiredToTheRunTracker:
-    """The wiring, which the unit tests above do NOT cover.
+    """The wiring, which the unit tests above do not cover.
 
-    The daemon could stop calling `note_occurrence`, stop marking a run
-    escalated, post both embeds, or ignore the disable guard, and the unit
-    tests above would all still pass. These drive the real
-    `_process_log_line` over simulated time, with nothing backdated by hand.
+    These drive the real `_process_log_line` over simulated time, with nothing
+    backdated by hand.
     """
 
     LINE = "ERROR Ollama error: Server disconnected without sending a response"
@@ -1406,11 +1423,12 @@ class TestTheDaemonIsWiredToTheRunTracker:
         return [c.kwargs.get("title", "") for c in client.send_embed.call_args_list]
 
     def test_a_sustained_outage_pings_exactly_once(self):
-        """Pins `note_occurrence`, `clear_run`, and the elif, all at once.
+        """Pins `note_occurrence`, `mark_escalated` and the elif, all at once.
 
         Without `note_occurrence` no run accumulates and nothing ever pings.
-        Without `clear_run` every line past the threshold pings again. With
-        `if` instead of `elif` the escalation also posts the old Warning embed.
+        Without `mark_escalated` every line past the threshold pings again.
+        With `if` instead of `elif` the escalation also posts the old Warning
+        embed.
         """
         from datetime import datetime
 
@@ -1546,5 +1564,13 @@ class TestTheEscalationConfigReachesTheDaemon:
                 env={"DISCORD_WEBHOOK_URL": "https://discord.test/hook"},
             )
         assert res.exit_code == 0, res.output
-        assert seen.get("escalate_after_minutes", 0) > 0, seen
-        assert seen.get("escalate_after_occurrences", 0) > 1, seen
+        # The CLI default must BE the constant, not merely non-zero. The band
+        # test below guards the constants; production goes through this CLI, so
+        # a hardcoded default here would leave that band guarding nothing.
+        from cortex_utils.alerter.rate_limiter import (
+            DEFAULT_ESCALATE_AFTER_MINUTES,
+            DEFAULT_ESCALATE_AFTER_OCCURRENCES,
+        )
+
+        assert seen.get("escalate_after_minutes") == DEFAULT_ESCALATE_AFTER_MINUTES, seen
+        assert seen.get("escalate_after_occurrences") == DEFAULT_ESCALATE_AFTER_OCCURRENCES, seen

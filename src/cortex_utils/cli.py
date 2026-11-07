@@ -18,6 +18,10 @@ import structlog
 
 from cortex_utils import backfill_walker as bw
 from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
+from cortex_utils.alerter.rate_limiter import (
+    DEFAULT_ESCALATE_AFTER_MINUTES,
+    DEFAULT_ESCALATE_AFTER_OCCURRENCES,
+)
 from cortex_utils.config import Config
 from cortex_utils.health.watchdog import Watchdog, parse_peers
 from cortex_utils.log import get_logger
@@ -669,13 +673,13 @@ def alerter() -> None:
 @click.option("--summary-hour", default=6, type=int, help="Hour (0-23) to send daily summary")
 @click.option(
     "--escalate-after",
-    default=30,
+    default=DEFAULT_ESCALATE_AFTER_MINUTES,
     type=int,
     help="Minutes a HIGH error must keep firing before it is sent as CRITICAL (0 disables)",
 )
 @click.option(
     "--escalate-occurrences",
-    default=3,
+    default=DEFAULT_ESCALATE_AFTER_OCCURRENCES,
     type=int,
     help="Occurrences required alongside --escalate-after, so a one-second burst is not an outage",
 )
