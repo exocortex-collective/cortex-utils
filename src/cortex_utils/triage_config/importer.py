@@ -277,19 +277,19 @@ def validate_rules(config: RulesConfig) -> list[str]:
                 )
 
             # The labeling worker applies only labels under the prefix, so a
-            # raw add/remove_label outside it would be dropped silently
-            # (cortex-gvzf). An empty prefix means every label is managed.
-            # `label` is left alone: the matcher prefixes it.
+            # raw add_label outside it would be dropped silently (cortex-gvzf).
+            # An empty prefix means every label is managed. `label` is left
+            # alone (the matcher prefixes it), and so is remove_label, which
+            # the worker never reads.
             actions = [("action", rule.action)] if rule.action else []
             actions += [(f"route '{k}'", a) for k, a in (rule.routes or {}).items()]
             for where, action in actions:
-                for field in ("add_label", "remove_label"):
-                    for name in _unmanaged(getattr(action, field), config.label_prefix):
-                        errors.append(
-                            f"Chain '{chain_name}' rule {i}: {where} {field} '{name}' "
-                            f"is outside '{config.label_prefix}/', so the labeling "
-                            "worker would drop it"
-                        )
+                for name in _unmanaged(action.add_label, config.label_prefix):
+                    errors.append(
+                        f"Chain '{chain_name}' rule {i}: {where} add_label '{name}' "
+                        f"is outside '{config.label_prefix}/', so the labeling "
+                        "worker would drop it"
+                    )
 
             # Validate route action label templates
             if rule.routes:

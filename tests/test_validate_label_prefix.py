@@ -1,5 +1,5 @@
-"""validate_rules refuses an add_label/remove_label the labeling worker would
-drop (cortex-gvzf)."""
+"""validate_rules refuses an add_label the labeling worker would drop
+(cortex-gvzf)."""
 
 from cortex_utils.triage_config import validate_rules
 from cortex_utils.triage_config.models import (
@@ -15,9 +15,7 @@ from cortex_utils.triage_config.models import (
 def _config(prefix: str, action: Action, routed: Action | None = None) -> RulesConfig:
     rules = [Rule(match=MatchCondition(), action=action)]
     if routed:
-        rules.append(
-            Rule(llm=LLMConfig(model="m", prompt_version="v1"), routes={"x": routed})
-        )
+        rules.append(Rule(llm=LLMConfig(model="m", prompt_version="v1"), routes={"x": routed}))
     return RulesConfig(label_prefix=prefix, chains={"main": ChainConfig(rules=rules)})
 
 
@@ -27,10 +25,16 @@ def test_an_add_label_outside_the_prefix_is_refused() -> None:
     assert "add_label" in errors[0]
 
 
-def test_each_name_in_a_list_and_remove_label_are_checked() -> None:
-    action = Action(add_label=["Cortex/A", "B"], remove_label=["Cortex/C", "D/E"])
-    errors = validate_rules(_config("Cortex", action))
-    assert sorted(e.split("'")[3] for e in errors) == ["B", "D/E"]
+def test_each_name_in_a_list_is_checked() -> None:
+    errors = validate_rules(_config("Cortex", Action(add_label=["Cortex/A", "B", "C/D"])))
+    assert len(errors) == 2
+    assert "'B'" in errors[0] and "'C/D'" in errors[1]
+
+
+def test_remove_label_is_not_checked() -> None:
+    """The labeling worker never reads remove_label, so it cannot drop one."""
+    action = Action(add_label="Cortex/A", remove_label=["INBOX", "Old/X"])
+    assert validate_rules(_config("Cortex", action)) == []
 
 
 def test_a_route_add_label_is_checked() -> None:
