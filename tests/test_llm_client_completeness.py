@@ -519,8 +519,8 @@ class TestTheApiKeyReachesTheRequest:
         return seen.get(path)
 
     def test_base_url_is_normalised(self):
-        """Asserted directly, so the blank-key warning is not the only place
-        this is checked.
+        """A trailing slash is stripped. Asserted directly, so the blank-key
+        warning is not its only guard.
         """
         assert LLMClient("http://llm.test/", api_key="k").base_url == "http://llm.test"
 
