@@ -8,7 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Pinned, not :latest. This image's build now depends on
+# --no-install-project and on uv's editable-install behaviour, so the tool
+# that provides them is not a floating tag.
+COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /usr/local/bin/uv
 
 # Copy dependency files. README.md belongs here despite being docs: pyproject
 # declares it as the project readme, so hatchling reads it during uv sync.

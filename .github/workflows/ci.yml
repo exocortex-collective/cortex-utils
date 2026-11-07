@@ -81,21 +81,29 @@ jobs:
       - name: Build image
         run: docker build -t utils:ci .
 
-      - name: The image starts with no network
+      - name: The image starts with no network, as its declared user
         run: |
           # --network none is the whole point: `uv run` re-resolves the project
           # on a fresh container and fetches hatchling from pypi, so the old
           # entrypoint could not boot without DNS. A smoke that gives the
           # container a network cannot catch that.
           #
-          # --user root because the image cannot run as its declared appuser
-          # (cortex-lhuj, pre-existing and tracked separately). The deployed
-          # stack sets user: root for the same reason, so this matches
-          # production rather than papering over it quietly.
-          out=$(docker run --rm --network none --user root utils:ci --help 2>&1 || true)
-          echo "$out" | tail -3
-          echo "$out" | grep -q "Cortex operational utilities" || {
-            echo "::error::the image could not start without the network"; exit 1; }
+          # No --user override: the image must work as the appuser it declares.
+          # Measured from a git-archive build, --network none: this image boots
+          # as appuser, and the pre-fix image fails as appuser AND as root.
+          # Smoking as root would hide a regression to a root-only image.
+          #
+          # No `|| true`: a non-zero exit is a failure even if something was
+          # printed. The grep is the second gate, not the only one.
+          docker run --rm --network none utils:ci --help > /tmp/smoke.out 2>&1 \
+            || { echo "::error::the image could not start without the network"; \
+                 tail -5 /tmp/smoke.out; exit 1; }
+          tail -3 /tmp/smoke.out
+          grep -q "Cortex operational utilities" /tmp/smoke.out \
+            || { echo "::error::the image started but did not print its CLI usage"; exit 1; }
+          # A second entry point, so the smoke covers more than cli.py's imports.
+          docker run --rm --network none utils:ci queue --help > /tmp/smoke2.out 2>&1 \
+            || { echo "::error::`queue --help` failed offline"; tail -5 /tmp/smoke2.out; exit 1; }
 
   build:
     runs-on: ubuntu-latest
