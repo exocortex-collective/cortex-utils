@@ -140,8 +140,8 @@ def test_the_project_itself_is_installed_after_its_source_is_copied():
     installing = [
         i
         for i, line in enumerate(lines)
-        # Any --no-install-* flag disables it, not just --no-install-project:
-        # --no-install-package and --no-install-workspace do too.
+        # Any --no-install-* flag is treated as disabling it, conservatively:
+        # --no-install-package skips only the package it names.
         if re.search(r"^\s*RUN\s+uv\s+sync", line) and "--no-install-" not in line
     ]
     assert installing, (
@@ -277,8 +277,7 @@ RESOLUTION_CASES = [
     ("a bare JSON string", 'CMD "a"', ["/bin/sh", "-c", '"a"']),
     ("a JSON number", "CMD 42", ["/bin/sh", "-c", "42"]),
     ("a JSON object", 'CMD {"a": 1}', ["/bin/sh", "-c", '{"a": 1}']),
-    # Pins the line-continuation join: without it each half reads as a
-    # separate, unparseable instruction.
+    # Pins the line-continuation join.
     (
         "an ENTRYPOINT split over continuation lines",
         'ENTRYPOINT [ \\\n    "a", \\\n    "b"]',
