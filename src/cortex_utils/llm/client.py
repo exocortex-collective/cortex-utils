@@ -146,15 +146,13 @@ class LLMClient:
             api_key: Sent as "Authorization: Bearer <key>" on every request,
                 including the native /api/generate fallback, because the header
                 is set on the httpx client rather than at a call site. Omit it
-                for an endpoint that needs none -- ollama direct, which is how
-                triage and the CLI reach a model. The LiteLLM proxy on ares
-                DOES need one: measured 2026-11-07, it answers 401 "No api key
-                passed in" without it, which is why this parameter exists.
+                for an endpoint that needs none, which is how the direct-ollama
+                callers reach a model; a proxy that requires one answers 401
+                without it (measured 2026-11-07).
 
-                Blank or whitespace-only is treated as ABSENT. httpx sends such
-                a value happily (checked, it raises nothing), so the failure
-                would be a 401 from a credential that looks present -- the same
-                trap the gateway token has already sprung on this estate.
+                Blank or whitespace-only is treated as ABSENT: httpx sends such
+                a value without complaint, so the failure would be a 401 from a
+                credential that looks present.
         """
         self.base_url = base_url.rstrip("/")
         key = (api_key or "").strip()
