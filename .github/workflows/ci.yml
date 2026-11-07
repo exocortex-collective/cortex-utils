@@ -86,10 +86,12 @@ jobs:
           # No --user override: the image must work as the appuser it declares,
           # or a regression to a root-only image would pass unnoticed.
           #
-          # Do not set any UV_* variable here. With UV_OFFLINE=1 the pre-fix
-          # image DOES boot, from the warm uv cache the build leaves in /root;
-          # without it uv revalidates its index over the network and fails. So
-          # the absence of UV_OFFLINE is what makes this smoke discriminate.
+          # Do not set UV_OFFLINE here. It is a ROOT-ONLY escape hatch: as
+          # root the pre-fix image boots with UV_OFFLINE=1 from the warm uv
+          # cache the build leaves in /root. As appuser -- which is what this
+          # step runs as -- that cache is unreadable (/root is drwx------) and
+          # it fails either way, so this step discriminates with or without it.
+          # Combined with a --user override it would stop discriminating.
           docker run --rm --network none utils:ci --help > /tmp/smoke.out 2>&1 \
             || { echo "::error::the image could not start without the network"; \
                  tail -5 /tmp/smoke.out; exit 1; }
@@ -97,10 +99,44 @@ jobs:
           grep -q "Cortex operational utilities" /tmp/smoke.out \
             || { echo "::error::the image started but did not print its CLI usage"; exit 1; }
           # Proves click subcommand dispatch. It adds no IMPORT coverage:
-          # cli.py imports everything at module top, so both probes load the
-          # same 24 cortex_utils modules (measured with -X importtime).
+          # both probes load the same 24 cortex_utils modules, measured with
+          # -X importtime. Neither reaches cortex_utils.introspect, which
+          # cli.py imports lazily inside functions.
           docker run --rm --network none utils:ci queue --help > /tmp/smoke2.out 2>&1 \
             || { echo "::error::queue --help failed offline"; tail -5 /tmp/smoke2.out; exit 1; }
+
+      - name: The smoke can actually fail (negative control)
+        run: |
+          # Asserts the PROPERTY by EXECUTING it, rather than linting this
+          # file for ways to defeat it. Every round of review found another
+          # spelling the lint did not know -- a bare || true, a commented-out
+          # grep, continue-on-error, set +e, an echoed exit 1, exit 10 -- so
+          # the list was never going to close. This step notices if the smoke
+          # above can be weakened by any means, including one not yet invented.
+          python3 - <<'PYEOF'
+          import pathlib
+          t = pathlib.Path("Dockerfile").read_text()
+          target = "RUN uv sync --frozen --no-dev\n"
+          i = t.rindex(target)   # the post-COPY sync, the one that fixes the bug
+          pathlib.Path("Dockerfile.broken").write_text(t[:i] + t[i + len(target):])
+          PYEOF
+          # The BUILD must succeed, or this control proves nothing: an
+          # unbuildable variant also exits non-zero and would look like a pass.
+          docker build -q -f Dockerfile.broken -t utils:broken . > /dev/null \
+            || { echo "::error::the negative control could not be BUILT, so it proves nothing"; \
+                 exit 1; }
+          if docker run --rm --network none utils:broken --help > /tmp/neg.out 2>&1; then
+            echo "::error::the deliberately broken image BOOTED, so the smoke above cannot detect one"
+            tail -5 /tmp/neg.out
+            exit 1
+          fi
+          # And it must fail for the RIGHT reason. Any other failure (a bad
+          # docker invocation, a missing image) would otherwise count as proof.
+          grep -q "/app/.venv/bin" /tmp/neg.out \
+            || { echo "::error::the broken image failed, but not on the baked venv -- this control is measuring something else"; \
+                 tail -5 /tmp/neg.out; exit 1; }
+          echo "negative control OK: the broken image fails on the baked venv, as expected"
+          tail -2 /tmp/neg.out
 
   build:
     runs-on: ubuntu-latest
