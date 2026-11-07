@@ -28,3 +28,5 @@ DISCORD_WEBHOOK_URL=... cortex-utils alerter test
 
 - `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` - Database
 - `DISCORD_WEBHOOK_URL` - Discord webhook for alerts
+- `ALERTER_METRICS_PORT` - opt-in: serve the alerter's heartbeat (`cortex_alerter_heartbeat_timestamp_seconds`, `_containers_watched`, `_tailers_alive`) on this port, for Prometheus to watch the alerter (cortex-ogqq). Unset: no port is opened.
+- `ALERTER_METRICS_ADDR` - bind address for that port; default `127.0.0.1`. A container scraped from another container sets `0.0.0.0` explicitly.

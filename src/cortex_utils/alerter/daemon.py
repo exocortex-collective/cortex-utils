@@ -7,6 +7,7 @@ from datetime import datetime
 
 import docker
 import schedule
+from prometheus_client import CollectorRegistry, Gauge, start_http_server
 
 from cortex_utils.log import get_logger
 
@@ -37,6 +38,38 @@ CONTAINER_PREFIX = "cortex-"
 # own logs. That needs an external watcher (~/HomeLab scripts/checks.d/), so it
 # is excluded rather than implying coverage it cannot provide. cortex-ogqq.
 DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
+
+# cortex-ogqq: the alerter cannot report its own death, so it publishes a
+# heartbeat for Prometheus to watch (alerts then reach Discord through
+# alertmanager, not through this process). OPT-IN: with ALERTER_METRICS_PORT
+# unset no port is opened and nothing changes. The bind address defaults to
+# loopback; a container that Prometheus scrapes from elsewhere sets
+# ALERTER_METRICS_ADDR=0.0.0.0 explicitly.
+METRICS_PORT_ENV = "ALERTER_METRICS_PORT"
+METRICS_ADDR_ENV = "ALERTER_METRICS_ADDR"
+DEFAULT_METRICS_ADDR = "127.0.0.1"
+# its own registry, so importing this module adds nothing to a host
+# process's default /metrics
+METRICS_REGISTRY = CollectorRegistry()
+HEARTBEAT = Gauge(
+    "cortex_alerter_heartbeat_timestamp_seconds",
+    "Unix time of the alerter scheduler loop's last pass (every ~60s)",
+    registry=METRICS_REGISTRY,
+)
+CONTAINERS_WATCHED = Gauge(
+    "cortex_alerter_containers_watched", "Containers the alerter tails", registry=METRICS_REGISTRY
+)
+TAILERS_ALIVE = Gauge(
+    "cortex_alerter_tailers_alive", "Log-tailer threads still running", registry=METRICS_REGISTRY
+)
+
+
+def metrics_bind(environ: dict[str, str]) -> tuple[str, int] | None:
+    """(addr, port) to serve the heartbeat on, or None when not enabled."""
+    port = environ.get(METRICS_PORT_ENV, "").strip()
+    if not port:
+        return None
+    return environ.get(METRICS_ADDR_ENV, "").strip() or DEFAULT_METRICS_ADDR, int(port)
 
 
 def discover_containers(names: list[str]) -> list[str]:
@@ -92,6 +125,7 @@ class AlerterDaemon:
 
         # Track running threads
         self._threads: list[threading.Thread] = []
+        self._tailers: list[threading.Thread] = []
         self._stop_event = threading.Event()
 
     def _connect_docker(self) -> bool:
@@ -352,7 +386,19 @@ class AlerterDaemon:
                 schedule.run_pending()
             except Exception:
                 log.exception("Scheduled job raised; the scheduler stays up")
+            self._beat()
             time.sleep(60)
+
+    def _serve_metrics(self, environ: dict[str, str]) -> None:
+        bind = metrics_bind(environ)
+        if bind is None:
+            return
+        start_http_server(bind[1], addr=bind[0], registry=METRICS_REGISTRY)
+        log.info("Heartbeat metrics serving", addr=bind[0], port=bind[1])
+
+    def _beat(self) -> None:
+        HEARTBEAT.set(time.time())
+        TAILERS_ALIVE.set(sum(1 for t in self._tailers if t.is_alive()))
 
     def send_test_alert(self) -> bool:
         """Send a test alert to verify webhook is working.
@@ -422,7 +468,12 @@ class AlerterDaemon:
             )
             thread.start()
             self._threads.append(thread)
+            self._tailers.append(thread)
             log.info("Started log tailer", container=container_name)
+
+        CONTAINERS_WATCHED.set(len(self.containers))
+        self._serve_metrics(dict(os.environ))
+        self._beat()
 
         # Send startup notification
         self.discord.send(
