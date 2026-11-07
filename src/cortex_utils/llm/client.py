@@ -139,9 +139,29 @@ INVALID_LLM_EXTRACTION_VALUES = {
 class LLMClient:
     """Client for LLM calls (supports OpenAI-compatible endpoints)."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, api_key: str | None = None):
+        """
+        Args:
+            base_url: The endpoint root. No default: these repos are public.
+            api_key: Sent as "Authorization: Bearer <key>" on every request,
+                including the native /api/generate fallback, because the header
+                is set on the httpx client rather than at a call site. Omit it
+                for an endpoint that needs none -- ollama direct, which is how
+                triage and the CLI reach a model. The LiteLLM proxy on ares
+                DOES need one: measured 2026-11-07, it answers 401 "No api key
+                passed in" without it, which is why this parameter exists.
+
+                Blank or whitespace-only is treated as ABSENT. httpx sends such
+                a value happily (checked, it raises nothing), so the failure
+                would be a 401 from a credential that looks present -- the same
+                trap the gateway token has already sprung on this estate.
+        """
         self.base_url = base_url.rstrip("/")
-        self.client = httpx.Client(timeout=120.0)
+        key = (api_key or "").strip()
+        self.client = httpx.Client(
+            timeout=120.0,
+            headers={"Authorization": f"Bearer {key}"} if key else {},
+        )
 
     def _post_completion(
         self,

@@ -474,3 +474,78 @@ class TestTheReturnTypeIsEnforcedNotJustAnnotated:
             _wrap(json.dumps({"category": "Newsletter", "confidence": 0.9, "reasoning": None}))
         )
         assert c.classify("p", "m")[2] == ""
+
+
+class TestTheApiKeyReachesTheRequest:
+    """The LiteLLM proxy answers 401 without a key, and the client had no way
+    to send one -- so reflex, the only service that goes through the proxy,
+    could not classify anything (utils-cb03).
+
+    Asserted on the WIRE, not on the constructor: a header set on the client
+    and then dropped at a call site looks identical from __init__.
+    """
+
+    @staticmethod
+    def _authorization_seen(
+        client: LLMClient, url_suffix: str = "/v1/chat/completions"
+    ) -> str | None:
+        seen: dict[str, str | None] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen[request.url.path] = request.headers.get("authorization")
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"ok": 1}'}, "finish_reason": "stop"}]},
+            )
+
+        # The client's own headers, not a fresh dict: if __init__ stops setting
+        # them, this transport sees nothing and the test fails.
+        client.client = httpx.Client(
+            transport=httpx.MockTransport(handler), headers=client.client.headers
+        )
+        client._post_completion(model="m", prompt="p", max_tokens=10)
+        return seen.get(url_suffix)
+
+    def test_a_key_is_sent_as_a_bearer_header(self):
+        c = LLMClient("http://llm.test", api_key="sk-secret")
+        assert self._authorization_seen(c) == "Bearer sk-secret"
+
+    def test_no_key_sends_no_authorization_header(self):
+        c = LLMClient("http://llm.test")
+        assert self._authorization_seen(c) is None
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
+    def test_a_blank_key_is_absent_not_malformed(self, blank):
+        c = LLMClient("http://llm.test", api_key=blank)
+        assert self._authorization_seen(c) is None
+
+    @pytest.mark.parametrize("padded", ["  sk-secret", "sk-secret\n", " sk-secret \t"])
+    def test_surrounding_whitespace_is_stripped(self, padded):
+        c = LLMClient("http://llm.test", api_key=padded)
+        assert self._authorization_seen(c) == "Bearer sk-secret"
+
+    def test_the_native_fallback_carries_the_key_too(self):
+        """The /api/generate retry is a SECOND request. A header added only to
+        the chat-completions call would leave the fallback unauthenticated,
+        and the fallback is the path that runs when a model returns empty
+        content -- so the failure would appear only on some models.
+        """
+        seen: list[tuple[str, str | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((request.url.path, request.headers.get("authorization")))
+            if request.url.path.endswith("/api/generate"):
+                return httpx.Response(200, json={"response": '{"ok": 1}', "done_reason": "stop"})
+            # Empty content with a normal stop: unreadable, so the client
+            # falls back to the native endpoint.
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+            )
+
+        c = LLMClient("http://llm.test", api_key="sk-secret")
+        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=c.client.headers)
+        c._post_completion(model="m", prompt="p", max_tokens=10, reject_truncated=False)
+
+        paths = [p for p, _ in seen]
+        assert any(p.endswith("/api/generate") for p in paths), paths
+        assert {a for _, a in seen} == {"Bearer sk-secret"}
