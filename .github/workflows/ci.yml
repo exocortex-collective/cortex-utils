@@ -83,27 +83,24 @@ jobs:
 
       - name: The image starts with no network, as its declared user
         run: |
-          # --network none is the whole point: `uv run` re-resolves the project
-          # on a fresh container and fetches hatchling from pypi, so the old
-          # entrypoint could not boot without DNS. A smoke that gives the
-          # container a network cannot catch that.
+          # No --user override: the image must work as the appuser it declares,
+          # or a regression to a root-only image would pass unnoticed.
           #
-          # No --user override: the image must work as the appuser it declares.
-          # Measured from a git-archive build, --network none: this image boots
-          # as appuser, and the pre-fix image fails as appuser AND as root.
-          # Smoking as root would hide a regression to a root-only image.
-          #
-          # No `|| true`: a non-zero exit is a failure even if something was
-          # printed. The grep is the second gate, not the only one.
+          # Do not set any UV_* variable here. With UV_OFFLINE=1 the pre-fix
+          # image DOES boot, from the warm uv cache the build leaves in /root;
+          # without it uv revalidates its index over the network and fails. So
+          # the absence of UV_OFFLINE is what makes this smoke discriminate.
           docker run --rm --network none utils:ci --help > /tmp/smoke.out 2>&1 \
             || { echo "::error::the image could not start without the network"; \
                  tail -5 /tmp/smoke.out; exit 1; }
           tail -3 /tmp/smoke.out
           grep -q "Cortex operational utilities" /tmp/smoke.out \
             || { echo "::error::the image started but did not print its CLI usage"; exit 1; }
-          # A second entry point, so the smoke covers more than cli.py's imports.
+          # Proves click subcommand dispatch. It adds no IMPORT coverage:
+          # cli.py imports everything at module top, so both probes load the
+          # same 24 cortex_utils modules (measured with -X importtime).
           docker run --rm --network none utils:ci queue --help > /tmp/smoke2.out 2>&1 \
-            || { echo "::error::`queue --help` failed offline"; tail -5 /tmp/smoke2.out; exit 1; }
+            || { echo "::error::queue --help failed offline"; tail -5 /tmp/smoke2.out; exit 1; }
 
   build:
     runs-on: ubuntu-latest

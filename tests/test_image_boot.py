@@ -6,7 +6,8 @@ and a redeploy, or an ofelia job with `delete: true`, makes fresh ones. This
 image runs the alerter, so the same failure takes out the thing that would
 have reported it.
 
-Measured from a git-archive build (the modes CI sees), --network none:
+Measured from a git-archive build, so the file modes are the ones CI
+sees, with --network none:
 
     pre-fix image,  user=root      -> dns error fetching hatchling
     pre-fix image,  user=appuser   -> same
@@ -135,23 +136,45 @@ def test_ci_runs_the_image_with_no_network():
         )
 
 
-def test_the_ci_smoke_can_actually_fail():
+def test_every_smoke_has_a_failure_handler():
     """Pins the pass condition, not just the command.
 
     A smoke whose exit status is swallowed, or whose output is never checked,
     selects the right lines and asserts nothing that can fail.
+
+    Everything here is checked on COMMENT-STRIPPED lines and scoped to the
+    smoke step. An earlier version matched these strings anywhere in the file,
+    so a commented-out grep satisfied it, and one step's `exit 1` satisfied the
+    requirement for another's.
     """
     ci = (REPO / ".github/workflows/ci.yml").read_text()
-    smoke = [c for c in _joined(ci) if "docker run" in c and CI_IMAGE in c]
+    live = [_without_comment(x) for x in _joined(ci)]
+    smoke = [c for c in live if "docker run" in c and CI_IMAGE in c]
     assert smoke, f"no {CI_IMAGE} smoke to check"
-    assert "|| true" not in " ".join(smoke), (
-        "the smoke swallows the container's exit status, so a container that "
-        "cannot start would not fail the job"
+
+    for cmd in smoke:
+        # Every spelling of "ignore the exit status", not just `|| true`.
+        assert not re.search(r"\|\|\s*(true|:)\s*(;|$)", cmd), (
+            f"this smoke swallows the container's exit status, so a container "
+            f"that cannot start would not fail the job: {cmd.strip()}"
+        )
+        # Each smoke needs its OWN handler, on its own joined command.
+        assert "exit 1" in cmd, (
+            f"this smoke has no failure handler, so a container that cannot "
+            f"start would not fail the job: {cmd.strip()}"
+        )
+
+    # And something must assert on what was printed, or an image that exits 0
+    # without running the CLI passes. On a live line, not in a comment.
+    assert any('grep -q "Cortex operational utilities"' in c for c in live), (
+        "nothing live checks the smoke's OUTPUT, so an image that exits 0 "
+        "without running the CLI would pass"
     )
-    # Something must assert on what it printed, or an image that starts and
-    # does nothing useful passes.
-    assert 'grep -q "Cortex operational utilities"' in ci, (
-        "nothing checks the smoke's OUTPUT, so an image that exits 0 without "
-        "running the CLI would pass"
+
+    # UV_OFFLINE=1 makes even the pre-fix image boot offline, from the warm uv
+    # cache the build leaves in /root. Setting it here would silently retire
+    # this whole smoke.
+    assert not any("UV_OFFLINE" in c for c in live), (
+        "the CI step sets UV_OFFLINE, which lets `uv run` resolve from the "
+        "build's warm cache -- the smoke would stop discriminating"
     )
-    assert "exit 1" in ci, "the smoke never fails the job"
