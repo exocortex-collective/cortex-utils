@@ -70,6 +70,67 @@ jobs:
             tests/test_schema_live.py tests/test_import_staging_live.py \
             -q --no-header -p no:cacheprovider -p no:skipping
 
+  image:
+    # Runs on PRs too, unlike `build`, which is gated on main. An image that
+    # cannot start is not something to discover after merge.
+    runs-on: ubuntu-latest
+    needs: lint-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t utils:ci .
+
+      - name: The image boots with no network, as its declared user
+        run: |
+          # The checks live in ci/smoke.sh so the negative control below can
+          # run the SAME ones against a broken image. Do not inline them here.
+          #
+          # Do not set UV_OFFLINE either. It is a ROOT-ONLY escape hatch: as
+          # root the pre-fix image boots with UV_OFFLINE=1 from the warm uv
+          # cache the build leaves in /root. As appuser -- which is what this
+          # runs as -- that cache is unreadable (/root is drwx------) and it
+          # fails either way. Combined with --user root it would stop
+          # discriminating.
+          ci/smoke.sh utils:ci \
+            || { echo "::error::the image could not start without the network"; \
+                 tail -5 /tmp/smoke.help /tmp/smoke.queue; exit 1; }
+          tail -3 /tmp/smoke.help
+
+      - name: The boot probe can actually fail (negative control)
+        run: |
+          # Asserts the property by EXECUTING it, rather than linting ci.yml
+          # for ways to defeat it -- a list that never closed. Because it runs
+          # ci/smoke.sh itself and not a copy, any weakening that makes the
+          # probe exit 0 on an image that cannot start fails this step.
+          #
+          # That is a floor, not a proof the probe cannot be weakened: `set +e`
+          # alone slips past, since the probe's last command fails on the
+          # broken image anyway. test_the_boot_probe_* pins what this misses.
+          python3 - <<'PYEOF'
+          import pathlib
+          t = pathlib.Path("Dockerfile").read_text()
+          target = "RUN uv sync --frozen --no-dev\n"
+          i = t.rindex(target)   # the post-COPY sync, the one that fixes the bug
+          pathlib.Path("Dockerfile.broken").write_text(t[:i] + t[i + len(target):])
+          PYEOF
+          # The BUILD must succeed, or this control proves nothing: an
+          # unbuildable variant also exits non-zero and would look like a pass.
+          docker build -q -f Dockerfile.broken -t utils:broken . > /dev/null \
+            || { echo "::error::the negative control could not be BUILT, so it proves nothing"; \
+                 exit 1; }
+          if ci/smoke.sh utils:broken /tmp/neg; then
+            echo "::error::the broken image PASSED the boot probe, so the probe cannot reject one"
+            exit 1
+          fi
+          # And it must fail for the RIGHT reason. Any other failure (a bad
+          # docker invocation, a missing image) would otherwise count as proof.
+          grep -q "/app/.venv/bin" /tmp/neg.help \
+            || { echo "::error::the broken image failed, but not on the baked venv -- this control is measuring something else"; \
+                 tail -5 /tmp/neg.help; exit 1; }
+          echo "negative control OK: the probe rejects the broken image, on the baked venv"
+          tail -2 /tmp/neg.help
+
   build:
     runs-on: ubuntu-latest
     needs: lint-test
