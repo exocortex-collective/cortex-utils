@@ -846,7 +846,7 @@ def claim(
                   AND (next_attempt_at IS NULL
                        OR next_attempt_at <= statement_timestamp())
                   AND attempts < max_attempts
-                ORDER BY priority DESC, created_at
+                ORDER BY priority DESC, created_at, id
                 LIMIT %(lim)s
                 FOR UPDATE SKIP LOCKED
             )
@@ -859,7 +859,7 @@ def claim(
             """,
             {"q": queue_name, "vis": visibility_timeout_min, "lim": limit, "w": worker},
         )
-        return [
+        claimed = [
             {
                 "id": r[0],
                 "queue_name": r[1],
@@ -888,6 +888,40 @@ def claim(
             }
             for r in cur.fetchall()
         ]
+
+    # `claimable` orders the SELECT, but this is an
+    # `UPDATE ... FROM claimable ... RETURNING`, and RETURNING order is the
+    # order rows were UPDATED, which Postgres does not promise matches the
+    # CTE's ORDER BY. So the statement selects the right rows and hands them
+    # back in an arbitrary order, and every caller works a batch by iterating
+    # this list.
+    #
+    # That starves work. A consumer that cannot finish a batch inside its
+    # deadline releases the remainder, and release() spends no attempt -- the
+    # work never started, so that is correct. But a row that keeps landing in
+    # the unworked tail is re-claimed and re-released forever: attempts stays
+    # 0, nothing retires it, nothing logs, and the only symptom is a queue
+    # count that will not move. Measured on 2026-11-07: 67 triage jobs at
+    # priority -50 sat unattempted for hours while LOWER-priority rows from
+    # the same batch completed beside them.
+    #
+    # `id` is the third key in BOTH orderings, and it is load-bearing rather
+    # than tidiness. created_at is NOW(), the transaction timestamp, so one
+    # bulk enqueue gives every row an identical (priority, created_at) --
+    # measured on the live triage queue the same day: 2647 rows at priority
+    # -200 held only 6 distinct created_at values, the largest tie group being
+    # 555 rows against a batch_size of 100. Without `id` neither ordering is
+    # total over such a group: the CTE's LIMIT picks an arbitrary 100 of the
+    # 555, and a stable sort then preserves whatever order those arrived in.
+    # Ordering the SELECT fixes which rows are chosen; sorting here fixes the
+    # order they are worked in. Both are needed, because they are different
+    # arbitrary choices.
+    #
+    # Sorted in Python rather than wrapping the statement in another CTE
+    # because the values are already in each returned row and it keeps the
+    # claim a single statement.
+    claimed.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
+    return claimed
 
 
 def complete(
