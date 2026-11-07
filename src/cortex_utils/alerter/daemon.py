@@ -59,8 +59,13 @@ HEARTBEAT = Gauge(
 CONTAINERS_WATCHED = Gauge(
     "cortex_alerter_containers_watched", "Containers the alerter tails", registry=METRICS_REGISTRY
 )
-TAILERS_ALIVE = Gauge(
-    "cortex_alerter_tailers_alive", "Log-tailer threads still running", registry=METRICS_REGISTRY
+# A tailer thread never dies (its loop catches everything), so thread
+# liveness says nothing. What can drop is whether it holds a log stream: it
+# backs off without one while a container is gone or Docker errors.
+TAILERS_STREAMING = Gauge(
+    "cortex_alerter_tailers_streaming",
+    "Tailers holding a live Docker log stream (not backing off)",
+    registry=METRICS_REGISTRY,
 )
 
 
@@ -125,7 +130,7 @@ class AlerterDaemon:
 
         # Track running threads
         self._threads: list[threading.Thread] = []
-        self._tailers: list[threading.Thread] = []
+        self._streaming: dict[str, bool] = {}
         self._stop_event = threading.Event()
 
     def _connect_docker(self) -> bool:
@@ -278,15 +283,19 @@ class AlerterDaemon:
                 log.info("Starting log tail", container=container_name)
 
                 # Tail logs from now onwards
-                for log_entry in container.logs(
-                    stream=True, follow=True, since=datetime.now(), timestamps=False
-                ):
-                    if self._stop_event.is_set():
-                        break
+                self._streaming[container_name] = True
+                try:
+                    for log_entry in container.logs(
+                        stream=True, follow=True, since=datetime.now(), timestamps=False
+                    ):
+                        if self._stop_event.is_set():
+                            break
 
-                    line = log_entry.decode("utf-8", errors="replace").strip()
-                    if line:
-                        self._process_log_line(container_name, line)
+                        line = log_entry.decode("utf-8", errors="replace").strip()
+                        if line:
+                            self._process_log_line(container_name, line)
+                finally:
+                    self._streaming[container_name] = False
 
             except docker.errors.NotFound:
                 log.warning("Container not found, will retry", container=container_name)
@@ -390,15 +399,21 @@ class AlerterDaemon:
             time.sleep(60)
 
     def _serve_metrics(self, environ: dict[str, str]) -> None:
-        bind = metrics_bind(environ)
-        if bind is None:
+        """A bad port or one in use is logged, not fatal: the alerter keeps
+        alerting, and Prometheus sees its heartbeat target down."""
+        try:
+            bind = metrics_bind(environ)
+            if bind is None:
+                return
+            start_http_server(bind[1], addr=bind[0], registry=METRICS_REGISTRY)
+        except (ValueError, OSError):
+            log.exception("Heartbeat metrics NOT serving; the alerter runs on without them")
             return
-        start_http_server(bind[1], addr=bind[0], registry=METRICS_REGISTRY)
         log.info("Heartbeat metrics serving", addr=bind[0], port=bind[1])
 
     def _beat(self) -> None:
         HEARTBEAT.set(time.time())
-        TAILERS_ALIVE.set(sum(1 for t in self._tailers if t.is_alive()))
+        TAILERS_STREAMING.set(sum(self._streaming.values()))
 
     def send_test_alert(self) -> bool:
         """Send a test alert to verify webhook is working.
@@ -468,7 +483,6 @@ class AlerterDaemon:
             )
             thread.start()
             self._threads.append(thread)
-            self._tailers.append(thread)
             log.info("Started log tailer", container=container_name)
 
         CONTAINERS_WATCHED.set(len(self.containers))
