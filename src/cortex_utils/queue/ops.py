@@ -896,14 +896,22 @@ def claim(
     # back in an arbitrary order, and every caller works a batch by iterating
     # this list.
     #
-    # That starves work. A consumer that cannot finish a batch inside its
+    # That inverts priority. A consumer that cannot finish a batch inside its
     # deadline releases the remainder, and release() spends no attempt -- the
-    # work never started, so that is correct. But a row that keeps landing in
-    # the unworked tail is re-claimed and re-released forever: attempts stays
-    # 0, nothing retires it, nothing logs, and the only symptom is a queue
-    # count that will not move. Measured on 2026-11-07: 67 triage jobs at
-    # priority -50 sat unattempted for hours while LOWER-priority rows from
-    # the same batch completed beside them.
+    # work never started, so that is correct. The cost is that a stall is
+    # SILENT: a row left in the unworked tail increments nothing and logs
+    # nothing, so the only symptom is a queue count that does not move.
+    #
+    # Measured on 2026-11-07, twice about fifty minutes apart: in a 75s window
+    # the -50 band completed 0 while the LOWER-priority -100 band completed 5,
+    # and in a 90s window -50 completed 0 while -100 completed 4. 67 rows at
+    # -50 sat with attempts=0 for over two hours.
+    #
+    # What was NOT measured, and an earlier version of this comment asserted:
+    # that such a row starves forever. It does not -- the same -50 band
+    # drained 628 -> 671 between those two windows. Work comes out in bursts
+    # and WHICH band progresses in a given window is arbitrary. Episodic
+    # inversion, not indefinite starvation.
     #
     # `id` is the third key in BOTH orderings, and it is load-bearing rather
     # than tidiness. created_at is NOW(), the transaction timestamp, so one
