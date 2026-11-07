@@ -538,26 +538,27 @@ class TestTheApiKeyReachesTheRequest:
 
     @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
     def test_a_blank_key_is_reported(self, blank, capsys):
-        """Including "", which an env var set to nothing produces.
-
-        structlog writes to stdout; caplog does not see it.
-        """
+        """Including "", which an env var set to nothing produces."""
         LLMClient("http://llm.test", api_key=blank)
         out = capsys.readouterr().out
-        assert "api_key is blank; sending no Authorization header" in out
-        # The value itself is never echoed, wherever a mutant might put it.
+        assert "api_key is blank; sending no Authorization header to http://llm.test" in out
+        # In repr form only. A mutant appending the raw value survives, and
+        # only blank values reach this branch, so that is left alone.
         assert repr(blank) not in out
 
     @pytest.mark.parametrize("fine", [None, "sk-secret"])
     def test_a_usable_or_absent_key_is_silent(self, fine, capsys):
         """No key at all is the normal direct-ollama configuration, and a
-        working key is the normal proxy one. Neither is a problem, so neither
-        gets a warning -- without this, a guard that warns on every
-        construction passes every other test here.
+        working key is the normal proxy one. Neither gets a warning -- without
+        this, a guard that warns on every construction passes every other test
+        here.
+
+        Asserted as NO output rather than as the absence of a keyword, so a
+        reworded warning cannot pass this test quietly.
         """
         LLMClient("http://llm.test", api_key=fine)
         captured = capsys.readouterr()
-        assert "blank" not in captured.out + captured.err
+        assert captured.out + captured.err == ""
 
     def test_a_real_key_is_never_logged(self, capsys):
         LLMClient("http://llm.test", api_key="sk-secret")
