@@ -27,7 +27,12 @@ from unittest import mock
 import httpx
 import pytest
 
-from cortex_utils.llm.client import LLMClient, LLMError, LLMTruncatedError
+from cortex_utils.llm.client import (
+    LLMClient,
+    LLMError,
+    LLMHTTPError,
+    LLMTruncatedError,
+)
 
 
 class TestTruncationIsNotCompletion:
@@ -601,3 +606,346 @@ class TestTheApiKeyReachesTheRequest:
         paths = [p for p, _ in seen]
         assert any(p.endswith("/api/generate") for p in paths), paths
         assert {a for _, a in seen} == {"Bearer sk-secret"}
+
+
+class TestAnHttpFaultIsAnLLMError:
+    """An HTTP fault escaped as httpx.HTTPStatusError, which is not an
+    LLMError -- so a caller branching on LLMError never saw it (utils-3258).
+    """
+
+    # A body that PARSES, so the status check is the only thing that can
+    # raise. With an unparseable one these tests pass without the fix.
+    GOOD_BODY = {"choices": [{"message": {"content": '{"ok": 1}'}, "finish_reason": "stop"}]}
+
+    @classmethod
+    def _client_answering(cls, status: int, path: str = "/v1/chat/completions", body=None):
+        c = LLMClient("http://llm.test", api_key="k")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == path:
+                if body is not None:
+                    return httpx.Response(status, content=body)
+                return httpx.Response(status, json=cls.GOOD_BODY)
+            # The primary call succeeds with EMPTY content, which is what
+            # sends _post_completion to the native endpoint.
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+            )
+
+        original = c.client
+        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=original.headers)
+        original.close()
+        return c
+
+    @staticmethod
+    def _post(c: LLMClient):
+        return c._post_completion(model="m", prompt="p", max_tokens=10)
+
+    def test_a_401_raises_an_llm_error_naming_the_status(self):
+        """The cascade's requirement (an LLMError) and the diagnosis (which
+        status) in one assertion, over a body that would otherwise parse.
+        """
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert isinstance(caught.value, LLMHTTPError)
+        assert caught.value.status_code == 401
+        assert "401" in str(caught.value)
+
+    def test_the_message_names_which_request_failed(self):
+        """`where` is the only thing distinguishing the two POSTs in a log."""
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "chat completions" in str(caught.value)
+
+    def test_a_401_is_not_retryable(self):
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert caught.value.retryable is False
+
+    @pytest.mark.parametrize("status", [408, 425, 429, 500, 502, 503])
+    def test_a_transient_fault_stays_retryable(self, status):
+        c = self._client_answering(status)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert caught.value.retryable is True
+
+    @pytest.mark.parametrize("status", [400, 403, 404, 413, 422, 431, 501, 505])
+    def test_a_permanent_fault_is_not_retryable(self, status):
+        """413, 431, 501 and 505 are the ones a status list tends to miss."""
+        c = self._client_answering(status)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert caught.value.retryable is False
+
+    @pytest.mark.parametrize("status", [301, 302, 307, 308])
+    def test_a_redirect_is_an_llm_error_too(self, status):
+        """`is_error` is 4xx/5xx only, so a 3xx needs the is_success guard to
+        become an LLMError rather than a raw JSONDecodeError. Permanent: this
+        client does not follow redirects.
+        """
+        c = self._client_answering(status)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert caught.value.status_code == status
+        assert caught.value.retryable is False
+
+    def test_a_200_that_is_not_json_is_an_llm_error(self):
+        """A proxy answering 200 with an HTML page. .json() raises
+        ValueError, which is not an LLMError and so bypasses a cascade.
+        """
+        c = self._client_answering(200, body=b"<html>no</html>")
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "not JSON" in str(caught.value)
+        assert "chat completions" in str(caught.value), "which request failed"
+
+    def test_the_fault_chains_the_original(self):
+        """`from e` -- the httpx or ValueError cause stays reachable for a
+        traceback, which is the only place the proxy's own body survives.
+        """
+        c = self._client_answering(200, body=b"<html>no</html>")
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert caught.value.__cause__ is not None
+
+    def test_llm_http_error_is_exported(self):
+        """A caller cannot catch what the package does not export."""
+        import cortex_utils.llm as pkg
+
+        assert pkg.LLMHTTPError is LLMHTTPError
+        assert "LLMHTTPError" in pkg.__all__
+
+    def test_the_native_fallback_404_reports_the_empty_response(self):
+        """/api/generate is an OLLAMA route; the proxy answers 404. The
+        fallback's own failure must not become the caller's diagnosis -- the
+        empty response is the finding, and a cascading caller needs an
+        LLMError so it tries its next tier.
+        """
+        c = self._client_answering(404, path="/api/generate")
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "empty response from chat completions" in str(caught.value)
+        assert "404" in str(caught.value), "the status, not just the type name"
+        assert caught.value.retryable is False, "a 404 route is permanent"
+        # Chained, so the fallback's own fault survives in a traceback even
+        # though the message is about the empty response.
+        assert isinstance(caught.value.__cause__, LLMHTTPError)
+        assert caught.value.__cause__.status_code == 404
+
+    def test_a_dead_native_host_does_not_leak_httpx(self):
+        """A CONNECTION failure on the fallback, not an HTTP status. Narrowing
+        the except tuple to LLMError alone survived every other test here, and
+        a dead /api/generate host would then leak a raw httpx exception past a
+        cascade -- the defect this PR exists to fix, on the path it adds.
+        """
+        c = LLMClient("http://llm.test", api_key="k")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/generate"):
+                raise httpx.ConnectError("no route to host")
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+            )
+
+        original = c.client
+        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=original.headers)
+        original.close()
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "empty response from chat completions" in str(caught.value)
+        # A CONNECTION failure is retryable, and httpx.RequestError has no
+        # `retryable`, so this is what the getattr default decides.
+        assert caught.value.retryable is True
+
+    def test_a_non_object_body_on_the_primary_path_is_an_llm_error(self):
+        """`null`, `[1]` and `"x"` are valid JSON. The object check was on the
+        native call site only, so a non-object here reached `result.get` in
+        _reject_if_truncated and escaped as a raw AttributeError.
+        """
+        for body in (b"null", b"[1]", b'"x"'):
+            c = self._client_answering(200, body=body)
+            try:
+                with pytest.raises(LLMError) as caught:
+                    self._post(c)
+            finally:
+                c.client.close()
+            assert "not an object" in str(caught.value), body
+            assert "chat completions" in str(caught.value), "which request failed"
+
+    def test_a_non_json_body_on_the_native_path_is_an_llm_error(self):
+        """The native call used .json() bare, so dropping ValueError from its
+        except tuple survived every other test here.
+        """
+        c = self._client_answering(200, path="/api/generate", body=b"<html>no</html>")
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "empty response from chat completions" in str(caught.value)
+        assert "native generate" in str(caught.value), "which request failed"
+
+    @pytest.mark.parametrize("status", [432, 451, 499])
+    def test_an_unlisted_4xx_is_not_retryable(self, status):
+        """Nothing between 432 and 499 was exercised, so `< 500` could have
+        been `< 499` unnoticed.
+        """
+        c = self._client_answering(status)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert caught.value.retryable is False
+
+    # EVERY re-raising public method, not just one. Each has its own
+    # `except LLMError: raise` arm; patched independently, five of the six
+    # were unguarded against an HTTP status, and `except Exception` would
+    # then rewrap a 401 as a plain LLMError with retryable defaulting True.
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda c: c.check_intent("subj", "p", "m"), id="check_intent"),
+            pytest.param(lambda c: c.classify("p", "m"), id="classify"),
+            pytest.param(
+                lambda c: c.check_email_intent("a@b.test", "subj", "body", "p", "m"),
+                id="check_email_intent",
+            ),
+            pytest.param(
+                lambda c: c.categorize_email("a@b.test", "subj", "body", "p", "m", ["admin"]),
+                id="categorize_email",
+            ),
+            pytest.param(
+                lambda c: c.classify_with_extraction("p", "m"),
+                id="classify_with_extraction",
+            ),
+        ],
+    )
+    def test_a_401_through_a_public_method_keeps_its_status(self, call):
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                call(c)
+        finally:
+            c.client.close()
+        assert caught.value.status_code == 401
+        assert caught.value.retryable is False
+
+    def test_the_message_carries_the_reason_phrase(self):
+        """The alerter's severity patterns match on the TEXT: without
+        "Unauthorized" a 401 classifies as a generic LLM error rather than an
+        authentication failure (alerter/classifier.py).
+        """
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "401 Unauthorized" in str(caught.value)
+
+    def test_a_status_with_no_reason_phrase_has_no_trailing_space(self):
+        """httpx gives "" for 599, so without the rstrip the message ends in
+        a space -- which reaches a log line and the alerter's dedup key.
+        """
+        c = self._client_answering(599)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert str(caught.value) == "chat completions returned HTTP 599"
+
+    def test_an_http_fault_is_not_logged_at_error_by_the_library(self, capsys):
+        """extract_value treats an HTTP fault as OPTIONAL and logs it at
+        warning. A logger.error in _raise_for_status runs upstream of that
+        choice, and the alerter matches level=error -- so re-adding one would
+        alert on every optional extraction failure.
+        """
+        c = self._client_answering(401)
+        try:
+            assert c.extract_value("a@b.test", "subj", "body", "p", "m") is None
+        finally:
+            c.client.close()
+        out = capsys.readouterr()
+        logged = out.out + out.err
+        # BOTH renderers: structlog emits JSON once configure_logging has run
+        # (as the services do) and the console format otherwise (as the suite
+        # does). Asserting only the JSON form made this test vacuous -- a
+        # re-added logger.error survived it.
+        # CRITICAL as well as error: alerter/classifier.py's _LEVEL_FIELD
+        # matches `error|critical`, so pinning only error guards half of what
+        # this test claims to protect -- a logger.critical survived it.
+        for level in ("error", "critical"):
+            assert f'"level": "{level}"' not in logged
+            assert f"[{level}" not in logged
+
+    def test_extract_value_still_swallows_an_http_fault(self):
+        """It returns None by design -- extraction is optional. The deleted
+        handler did that explicitly; the surviving `except LLMError` must do
+        the same.
+        """
+        c = self._client_answering(401)
+        try:
+            assert c.extract_value("a@b.test", "subj", "body", "p", "m") is None
+        finally:
+            c.client.close()
+
+    def test_a_native_body_that_is_not_an_object_is_an_llm_error(self):
+        """native_result.get would raise AttributeError on a list or a
+        string, which is not an LLMError.
+        """
+        c = LLMClient("http://llm.test", api_key="k")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/generate"):
+                return httpx.Response(200, json=["not", "an", "object"])
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+            )
+
+        original = c.client
+        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=original.headers)
+        original.close()
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "not an object" in str(caught.value)
