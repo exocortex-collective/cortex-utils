@@ -139,9 +139,26 @@ INVALID_LLM_EXTRACTION_VALUES = {
 class LLMClient:
     """Client for LLM calls (supports OpenAI-compatible endpoints)."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, api_key: str | None = None):
+        """
+        Args:
+            base_url: The endpoint root. No default: these repos are public.
+            api_key: Sent as "Authorization: Bearer <key>" on every request.
+                Omit it for an endpoint that needs none. A value that is
+                present but blank -- "" or whitespace -- is treated as absent
+                AND logged with the endpoint, because a 401 does not say
+                whether a credential was sent.
+        """
         self.base_url = base_url.rstrip("/")
-        self.client = httpx.Client(timeout=120.0)
+        key = (api_key or "").strip()
+        # `is not None`, not a truth test: "" is falsy, so a truth test here
+        # warns about "   " and stays silent about "".
+        if api_key is not None and not key:
+            logger.warning(f"api_key is blank; sending no Authorization header to {self.base_url}")
+        self.client = httpx.Client(
+            timeout=120.0,
+            headers={"Authorization": f"Bearer {key}"} if key else {},
+        )
 
     def _post_completion(
         self,
