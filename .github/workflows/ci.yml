@@ -70,6 +70,33 @@ jobs:
             tests/test_schema_live.py tests/test_import_staging_live.py \
             -q --no-header -p no:cacheprovider -p no:skipping
 
+  image:
+    # Runs on PRs too, unlike `build`, which is gated on main. An image that
+    # cannot start is not something to discover after merge.
+    runs-on: ubuntu-latest
+    needs: lint-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t utils:ci .
+
+      - name: The image starts with no network
+        run: |
+          # --network none is the whole point: `uv run` re-resolves the project
+          # on a fresh container and fetches hatchling from pypi, so the old
+          # entrypoint could not boot without DNS. A smoke that gives the
+          # container a network cannot catch that.
+          #
+          # --user root because the image cannot run as its declared appuser
+          # (cortex-lhuj, pre-existing and tracked separately). The deployed
+          # stack sets user: root for the same reason, so this matches
+          # production rather than papering over it quietly.
+          out=$(docker run --rm --network none --user root utils:ci --help 2>&1 || true)
+          echo "$out" | tail -3
+          echo "$out" | grep -q "Cortex operational utilities" || {
+            echo "::error::the image could not start without the network"; exit 1; }
+
   build:
     runs-on: ubuntu-latest
     needs: lint-test
