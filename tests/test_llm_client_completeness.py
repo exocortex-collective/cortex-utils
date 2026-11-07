@@ -518,6 +518,12 @@ class TestTheApiKeyReachesTheRequest:
             client._post_completion(model="m", prompt="p", max_tokens=10)
         return seen.get(path)
 
+    def test_base_url_is_normalised(self):
+        """Asserted directly, so the blank-key warning is not the only place
+        this is checked.
+        """
+        assert LLMClient("http://llm.test/", api_key="k").base_url == "http://llm.test"
+
     def test_a_key_is_sent_as_a_bearer_header(self):
         c = LLMClient("http://llm.test", api_key="sk-secret")
         assert self._authorization_seen(c) == "Bearer sk-secret"
@@ -537,19 +543,16 @@ class TestTheApiKeyReachesTheRequest:
         assert self._authorization_seen(c) == "Bearer sk-secret"
 
     @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
-    # The trailing slash is the point of the second case: the message must
-    # carry the NORMALISED base_url, so a mutant logging the raw argument
-    # rather than self.base_url is caught.
+    # The slashed URL is the second case because the message must carry the
+    # NORMALISED base_url. A positive substring check cannot tell the two
+    # apart, the normalised URL being a prefix of the slashed one, so the
+    # negative assertion below is what catches a raw `base_url`.
     @pytest.mark.parametrize("url", ["http://llm.test", "http://llm.test/"])
     def test_a_blank_key_is_reported(self, blank, url, capsys):
         """Including "", which an env var set to nothing produces."""
         LLMClient(url, api_key=blank)
         out = capsys.readouterr().out
         assert "api_key is blank; sending no Authorization header to http://llm.test" in out
-        # NOT the raw argument. A substring check alone cannot tell the two
-        # apart, because the normalised URL is a prefix of the slashed one --
-        # which is why the first version of this case did not kill the mutant
-        # that logs `base_url` instead of `self.base_url`.
         assert "header to http://llm.test/" not in out
         # In repr form only. A mutant appending the raw value survives, and
         # only blank values reach this branch, so that is left alone.
