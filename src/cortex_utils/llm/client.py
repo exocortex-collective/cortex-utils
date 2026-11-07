@@ -143,19 +143,15 @@ class LLMClient:
         """
         Args:
             base_url: The endpoint root. No default: these repos are public.
-            api_key: Sent as "Authorization: Bearer <key>" on every request,
-                including the native /api/generate fallback, because the header
-                is set on the httpx client rather than at a call site. Omit it
-                for an endpoint that needs none, which is how the direct-ollama
-                callers reach a model; a proxy that requires one answers 401
-                without it (measured 2026-11-07).
-
-                Blank or whitespace-only is treated as ABSENT: httpx sends such
-                a value without complaint, so the failure would be a 401 from a
-                credential that looks present.
+            api_key: Sent as "Authorization: Bearer <key>" on every request.
+                Omit it for an endpoint that needs none. Blank or
+                whitespace-only is treated as absent, and logged, because a
+                401 does not say whether a credential was sent.
         """
         self.base_url = base_url.rstrip("/")
         key = (api_key or "").strip()
+        if api_key and not key:
+            logger.warning("api_key is blank or whitespace-only; sending no Authorization header")
         self.client = httpx.Client(
             timeout=120.0,
             headers={"Authorization": f"Bearer {key}"} if key else {},

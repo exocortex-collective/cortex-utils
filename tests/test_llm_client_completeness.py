@@ -477,18 +477,12 @@ class TestTheReturnTypeIsEnforcedNotJustAnnotated:
 
 
 class TestTheApiKeyReachesTheRequest:
-    """The LiteLLM proxy answers 401 without a key, and the client had no way
-    to send one -- so reflex, the only service that goes through the proxy,
-    could not classify anything (utils-cb03).
-
-    Asserted on the WIRE, not on the constructor: a header set on the client
-    and then dropped at a call site looks identical from __init__.
+    """Asserted on the WIRE, not on the constructor: a header set in __init__
+    and dropped at a call site looks identical from __init__.
     """
 
     @staticmethod
-    def _authorization_seen(
-        client: LLMClient, url_suffix: str = "/v1/chat/completions"
-    ) -> str | None:
+    def _authorization_seen(client: LLMClient, path: str = "/v1/chat/completions") -> str | None:
         seen: dict[str, str | None] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -500,11 +494,16 @@ class TestTheApiKeyReachesTheRequest:
 
         # The client's own headers, not a fresh dict: if __init__ stops setting
         # them, this transport sees nothing and the test fails.
+        original = client.client
         client.client = httpx.Client(
-            transport=httpx.MockTransport(handler), headers=client.client.headers
+            transport=httpx.MockTransport(handler), headers=original.headers
         )
-        client._post_completion(model="m", prompt="p", max_tokens=10)
-        return seen.get(url_suffix)
+        try:
+            client._post_completion(model="m", prompt="p", max_tokens=10)
+        finally:
+            client.client.close()
+            original.close()
+        return seen.get(path)
 
     def test_a_key_is_sent_as_a_bearer_header(self):
         c = LLMClient("http://llm.test", api_key="sk-secret")
@@ -515,9 +514,30 @@ class TestTheApiKeyReachesTheRequest:
         assert self._authorization_seen(c) is None
 
     @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
-    def test_a_blank_key_is_absent_not_malformed(self, blank):
+    def test_a_blank_key_sends_no_authorization_header(self, blank):
         c = LLMClient("http://llm.test", api_key=blank)
         assert self._authorization_seen(c) is None
+
+    def test_a_blank_key_is_logged_without_echoing_it(self, capsys):
+        """A 401 does not say whether a credential was sent, so the one place
+        that knows has to say so. structlog writes to stdout, not through the
+        stdlib handlers caplog hooks -- caplog sees nothing here.
+
+        The message is asserted WHOLE, not by keyword. A keyword assertion
+        survived a mutant that interpolated the key into this very line: the
+        branch that could leak a credential is the blank-key branch, and
+        test_a_real_key_is_never_logged cannot reach it.
+        """
+        LLMClient("http://llm.test", api_key="   ")
+        assert (
+            "api_key is blank or whitespace-only; sending no Authorization header"
+            in capsys.readouterr().out
+        )
+
+    def test_a_real_key_is_never_logged(self, capsys):
+        LLMClient("http://llm.test", api_key="sk-secret")
+        captured = capsys.readouterr()
+        assert "sk-secret" not in captured.out + captured.err
 
     @pytest.mark.parametrize("padded", ["  sk-secret", "sk-secret\n", " sk-secret \t"])
     def test_surrounding_whitespace_is_stripped(self, padded):
@@ -525,10 +545,8 @@ class TestTheApiKeyReachesTheRequest:
         assert self._authorization_seen(c) == "Bearer sk-secret"
 
     def test_the_native_fallback_carries_the_key_too(self):
-        """The /api/generate retry is a SECOND request. A header added only to
-        the chat-completions call would leave the fallback unauthenticated,
-        and the fallback is the path that runs when a model returns empty
-        content -- so the failure would appear only on some models.
+        """The /api/generate retry is a SECOND request, and a header added only
+        to the chat-completions call would leave it unauthenticated.
         """
         seen: list[tuple[str, str | None]] = []
 
@@ -539,12 +557,18 @@ class TestTheApiKeyReachesTheRequest:
             # Empty content with a normal stop: unreadable, so the client
             # falls back to the native endpoint.
             return httpx.Response(
-                200, json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+                200,
+                json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
             )
 
         c = LLMClient("http://llm.test", api_key="sk-secret")
-        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=c.client.headers)
-        c._post_completion(model="m", prompt="p", max_tokens=10, reject_truncated=False)
+        original = c.client
+        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=original.headers)
+        try:
+            c._post_completion(model="m", prompt="p", max_tokens=10, reject_truncated=False)
+        finally:
+            c.client.close()
+            original.close()
 
         paths = [p for p, _ in seen]
         assert any(p.endswith("/api/generate") for p in paths), paths
