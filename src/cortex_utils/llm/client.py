@@ -17,40 +17,49 @@ logger = get_logger(__name__)
 
 
 class LLMError(Exception):
-    """Raised when LLM call fails (network, HTTP, or invalid response)."""
+    """An LLM call failed in a way a caller can branch on.
+
+    HTTP faults and unreadable responses raise this from anywhere in the
+    module. A NETWORK fault does not: _post_completion lets
+    httpx.RequestError through, and only the six public methods convert it.
+    """
 
     # Whether repeating the identical call could plausibly succeed.
     retryable: bool = True
 
 
-# Statuses where repeating the identical request cannot help. A missing,
-# blank or wrong key is 401/403; a route that does not exist is 404; a
-# malformed request is 400/422. Everything else -- 429, 500, 502, 503 -- is
-# worth another attempt.
-_NOT_RETRYABLE_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 422})
+# A rule rather than a list: the first version enumerated the permanent
+# statuses and left out 413, 414, 415, 431, 501 and 505, so an over-long
+# prompt rejected with 413 would have been retried.
+_RETRYABLE_4XX = frozenset({408, 425, 429})
+_PERMANENT_5XX = frozenset({501, 505})
+
+
+def _is_retryable(status_code: int) -> bool:
+    """Whether repeating the identical request could plausibly succeed."""
+    if status_code < 400:
+        # A 3xx this client never follows. Repeating it returns the redirect.
+        return False
+    if status_code < 500:
+        return status_code in _RETRYABLE_4XX
+    return status_code not in _PERMANENT_5XX
 
 
 class LLMHTTPError(LLMError):
-    """A non-2xx from the LLM endpoint, raised as an LLMError.
+    """A non-2xx from the LLM endpoint.
 
-    IT USED TO ESCAPE AS httpx.HTTPStatusError, and that is the defect this
-    class exists to fix. A caller that cascades -- reflex tries tier 1 and
-    falls back to tier 2 on LLMError -- never saw an HTTP fault, because
-    HTTPStatusError is not an LLMError: the handler did not catch it, the
-    second tier was never tried, and a raw httpx exception left the client.
-    The six public methods here wrapped it, so only a caller using
-    _post_completion directly was exposed; reflex is such a caller.
+    An LLMError so that a caller which branches on LLMError -- a tier-1 to
+    tier-2 cascade, for instance -- sees an HTTP fault at all. Raised as
+    httpx.HTTPStatusError, it was invisible to such a caller.
 
-    `retryable` comes from the STATUS rather than defaulting to True. A 401
-    from a wrong key cannot succeed on retry, and the triage worker honours
-    retryable: it would spend three attempts and dead-letter the job for a
-    configuration error that no number of attempts can fix.
+    `retryable` comes from the status. Nothing in this estate reads it yet;
+    LLMTruncatedError sets it for the same reason.
     """
 
     def __init__(self, message: str, status_code: int) -> None:
         super().__init__(message)
         self.status_code = status_code
-        self.retryable = status_code not in _NOT_RETRYABLE_STATUSES
+        self.retryable = _is_retryable(status_code)
 
 
 class LLMTruncatedError(LLMError):
@@ -193,11 +202,23 @@ class LLMClient:
     @staticmethod
     def _raise_for_status(response: httpx.Response, where: str) -> None:
         """httpx's raise_for_status, as an LLMError a cascade can catch."""
-        if not response.is_error:
+        # `not is_success`, NOT `is_error`: is_error is 4xx/5xx only, so a
+        # 3xx fell through to .json() and escaped as a raw JSONDecodeError --
+        # which is the very class of leak this helper exists to stop. The
+        # raise_for_status it replaces raised for every non-2xx.
+        if response.is_success:
             return
         code = response.status_code
         logger.error(f"{where} returned HTTP {code}")
         raise LLMHTTPError(f"{where} returned HTTP {code}", code)
+
+    @staticmethod
+    def _json_or_raise(response: httpx.Response, where: str) -> Any:
+        """A 200 is not a promise of JSON -- a proxy can answer with HTML."""
+        try:
+            return response.json()
+        except ValueError as e:
+            raise LLMError(f"{where} returned a body that is not JSON") from e
 
     def _post_completion(
         self,
@@ -243,7 +264,7 @@ class LLMClient:
             json=payload,
         )
         self._raise_for_status(response, "chat completions")
-        result: dict[str, Any] = response.json()
+        result: dict[str, Any] = self._json_or_raise(response, "chat completions")
 
         # Some models (qwen3.5, qwen3) return empty content on the chat
         # completions API. Fall back to native Ollama /api/generate endpoint.
@@ -257,18 +278,11 @@ class LLMClient:
                 self._reject_if_truncated(result)
             raise
         if not content.strip():
-            # BEST EFFORT, and that is the whole design of this block.
-            # /api/generate is an OLLAMA route. A caller pointed at the
-            # LiteLLM proxy has no such route -- measured 2026-11-07, the
-            # proxy answers 404 to it both authenticated and not, exactly as
-            # it answers a path that does not exist. So the fallback's own
-            # failure must never become the caller's diagnosis: the empty
-            # response is the real finding, and a caller that cascades needs
-            # to see THAT and try its next tier.
-            #
-            # Before this, the 404 surfaced as httpx.HTTPStatusError, which is
-            # not an LLMError, so reflex's tier-1 -> tier-2 cascade was
-            # skipped entirely and a raw exception left the classifier.
+            # Best effort. /api/generate is an OLLAMA route, and behind the
+            # LiteLLM proxy it answered 404 when measured on 2026-11-07, so
+            # the fallback's own failure must not become the caller's
+            # diagnosis: the empty response is the finding, and a cascading
+            # caller needs to see that and try its next tier.
             logger.debug("Empty response from chat completions, falling back to native API")
             native_payload: dict[str, Any] = {
                 "model": model,
@@ -289,11 +303,22 @@ class LLMClient:
                 )
                 self._raise_for_status(native_response, "native generate")
                 native_result = native_response.json()
-            except (LLMError, httpx.RequestError) as e:
-                raise LLMError(
+                if not isinstance(native_result, dict):
+                    raise LLMError(
+                        f"native generate returned JSON "
+                        f"{type(native_result).__name__}, not an object"
+                    )
+            except (LLMError, httpx.RequestError, ValueError) as e:
+                # The STATUS, not just the type name: an operator cannot tell
+                # a 404 route from a 500 backend from "LLMHTTPError".
+                failed = LLMError(
                     f"empty response from chat completions, and the native "
-                    f"fallback did not answer: {type(e).__name__}"
-                ) from e
+                    f"fallback did not answer: {e}"
+                )
+                # Carried from the cause rather than defaulted: a 404 route is
+                # permanent, and the default is True.
+                failed.retryable = getattr(e, "retryable", True)
+                raise failed from e
             result = {
                 "choices": [
                     {
@@ -450,9 +475,6 @@ class LLMClient:
         except httpx.RequestError as e:
             logger.error(f"LLM intent check network error: {e}")
             raise LLMError(f"LLM network error: {e}") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"LLM intent check HTTP error {e.response.status_code}: {e}")
-            raise LLMError(f"LLM HTTP {e.response.status_code}") from e
         except LLMError:
             raise  # Re-raise LLMError as-is
         except Exception as e:
@@ -502,9 +524,6 @@ class LLMClient:
         except httpx.RequestError as e:
             logger.error(f"LLM network error: {e}")
             raise LLMError(f"LLM network error: {e}") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"LLM HTTP error {e.response.status_code}: {e}")
-            raise LLMError(f"LLM HTTP {e.response.status_code}") from e
         except json.JSONDecodeError as e:
             logger.error(f"LLM returned invalid JSON: {e}")
             raise LLMError(f"LLM invalid JSON: {e}") from e
@@ -569,9 +588,6 @@ class LLMClient:
         except httpx.RequestError as e:
             logger.error(f"LLM email intent check network error: {e}")
             raise LLMError(f"LLM network error: {e}") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"LLM email intent check HTTP error {e.response.status_code}: {e}")
-            raise LLMError(f"LLM HTTP {e.response.status_code}") from e
         except LLMError:
             raise  # Re-raise LLMError as-is
         except Exception as e:
@@ -636,9 +652,6 @@ class LLMClient:
         except httpx.RequestError as e:
             logger.error(f"LLM categorize network error: {e}")
             raise LLMError(f"LLM network error: {e}") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"LLM categorize HTTP error {e.response.status_code}: {e}")
-            raise LLMError(f"LLM HTTP {e.response.status_code}") from e
         except LLMError:
             raise  # Re-raise LLMError as-is
         except Exception as e:
@@ -697,9 +710,6 @@ class LLMClient:
             return value
         except httpx.RequestError as e:
             logger.warning(f"LLM extraction network error: {e}")
-            return None
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"LLM extraction HTTP error {e.response.status_code}: {e}")
             return None
         except LLMError as e:
             # Helper raised LLMError - log as warning since extraction is optional
@@ -778,9 +788,6 @@ class LLMClient:
         except httpx.RequestError as e:
             logger.error(f"LLM network error: {e}")
             raise LLMError(f"LLM network error: {e}") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"LLM HTTP error {e.response.status_code}: {e}")
-            raise LLMError(f"LLM HTTP {e.response.status_code}") from e
         except json.JSONDecodeError as e:
             logger.error(f"LLM returned invalid JSON: {e}")
             raise LLMError(f"LLM invalid JSON: {e}") from e
