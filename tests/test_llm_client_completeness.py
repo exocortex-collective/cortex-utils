@@ -27,7 +27,12 @@ from unittest import mock
 import httpx
 import pytest
 
-from cortex_utils.llm.client import LLMClient, LLMError, LLMTruncatedError
+from cortex_utils.llm.client import (
+    LLMClient,
+    LLMError,
+    LLMHTTPError,
+    LLMTruncatedError,
+)
 
 
 class TestTruncationIsNotCompletion:
@@ -601,3 +606,99 @@ class TestTheApiKeyReachesTheRequest:
         paths = [p for p, _ in seen]
         assert any(p.endswith("/api/generate") for p in paths), paths
         assert {a for _, a in seen} == {"Bearer sk-secret"}
+
+
+class TestAnHttpFaultIsAnLLMError:
+    """An HTTP fault used to escape as httpx.HTTPStatusError, which is not an
+    LLMError -- so a caller that cascades on LLMError never saw it, skipped
+    its second tier, and let a raw httpx exception out (utils-3258).
+    """
+
+    @staticmethod
+    def _client_answering(status: int, path: str = "/v1/chat/completions"):
+        c = LLMClient("http://llm.test", api_key="k")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == path:
+                return httpx.Response(status, json={"detail": "nope"})
+            # The primary call succeeds with EMPTY content, which is what
+            # sends _post_completion to the native endpoint.
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+            )
+
+        original = c.client
+        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=original.headers)
+        original.close()
+        return c
+
+    def test_a_401_is_caught_by_a_cascade(self):
+        """The whole point: `except LLMError` must see it."""
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMError):
+                c._post_completion(model="m", prompt="p", max_tokens=10)
+        finally:
+            c.client.close()
+
+    def test_a_401_is_not_retryable(self):
+        """The triage worker honours retryable: it would spend three attempts
+        and dead-letter the job for a wrong key, which no retry can fix.
+        """
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                c._post_completion(model="m", prompt="p", max_tokens=10)
+        finally:
+            c.client.close()
+        assert caught.value.status_code == 401
+        assert caught.value.retryable is False
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503])
+    def test_a_server_fault_stays_retryable(self, status):
+        c = self._client_answering(status)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                c._post_completion(model="m", prompt="p", max_tokens=10)
+        finally:
+            c.client.close()
+        assert caught.value.retryable is True
+
+    @pytest.mark.parametrize("status", [400, 403, 404, 422])
+    def test_a_client_fault_is_not_retryable(self, status):
+        c = self._client_answering(status)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                c._post_completion(model="m", prompt="p", max_tokens=10)
+        finally:
+            c.client.close()
+        assert caught.value.retryable is False
+
+    def test_no_httpx_error_escapes(self):
+        """Stated as its own test because the defect was a TYPE, not a
+        message: anything that is not an LLMError bypasses every caller's
+        cascade.
+        """
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMError):
+                c._post_completion(model="m", prompt="p", max_tokens=10)
+        finally:
+            c.client.close()
+        assert not issubclass(LLMHTTPError, httpx.HTTPStatusError)
+
+    def test_the_native_fallback_404_reports_the_empty_response(self):
+        """/api/generate is an OLLAMA route; the LiteLLM proxy answers 404.
+        The fallback's own failure must not become the caller's diagnosis --
+        the empty response is the finding, and a cascading caller needs to
+        see an LLMError so it tries its next tier.
+        """
+        c = self._client_answering(404, path="/api/generate")
+        try:
+            with pytest.raises(LLMError) as caught:
+                c._post_completion(model="m", prompt="p", max_tokens=10)
+        finally:
+            c.client.close()
+        assert "empty response from chat completions" in str(caught.value)
+        assert "native fallback did not answer" in str(caught.value)

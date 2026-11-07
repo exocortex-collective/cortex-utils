@@ -23,6 +23,36 @@ class LLMError(Exception):
     retryable: bool = True
 
 
+# Statuses where repeating the identical request cannot help. A missing,
+# blank or wrong key is 401/403; a route that does not exist is 404; a
+# malformed request is 400/422. Everything else -- 429, 500, 502, 503 -- is
+# worth another attempt.
+_NOT_RETRYABLE_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 422})
+
+
+class LLMHTTPError(LLMError):
+    """A non-2xx from the LLM endpoint, raised as an LLMError.
+
+    IT USED TO ESCAPE AS httpx.HTTPStatusError, and that is the defect this
+    class exists to fix. A caller that cascades -- reflex tries tier 1 and
+    falls back to tier 2 on LLMError -- never saw an HTTP fault, because
+    HTTPStatusError is not an LLMError: the handler did not catch it, the
+    second tier was never tried, and a raw httpx exception left the client.
+    The six public methods here wrapped it, so only a caller using
+    _post_completion directly was exposed; reflex is such a caller.
+
+    `retryable` comes from the STATUS rather than defaulting to True. A 401
+    from a wrong key cannot succeed on retry, and the triage worker honours
+    retryable: it would spend three attempts and dead-letter the job for a
+    configuration error that no number of attempts can fix.
+    """
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = status_code not in _NOT_RETRYABLE_STATUSES
+
+
 class LLMTruncatedError(LLMError):
     """The model stopped because it ran out of budget, not because it finished.
 
@@ -160,6 +190,15 @@ class LLMClient:
             headers={"Authorization": f"Bearer {key}"} if key else {},
         )
 
+    @staticmethod
+    def _raise_for_status(response: httpx.Response, where: str) -> None:
+        """httpx's raise_for_status, as an LLMError a cascade can catch."""
+        if not response.is_error:
+            return
+        code = response.status_code
+        logger.error(f"{where} returned HTTP {code}")
+        raise LLMHTTPError(f"{where} returned HTTP {code}", code)
+
     def _post_completion(
         self,
         model: str,
@@ -184,7 +223,8 @@ class LLMClient:
 
         Raises:
             httpx.RequestError: Network errors.
-            httpx.HTTPStatusError: HTTP errors (non-2xx status).
+            LLMHTTPError: A non-2xx status. An LLMError, so a caller's
+                cascade catches it; see that class.
             LLMTruncatedError: The model stopped at the token budget.
             LLMError: The response shape is unreadable.
         """
@@ -202,7 +242,7 @@ class LLMClient:
             f"{self.base_url}/v1/chat/completions",
             json=payload,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "chat completions")
         result: dict[str, Any] = response.json()
 
         # Some models (qwen3.5, qwen3) return empty content on the chat
@@ -217,6 +257,18 @@ class LLMClient:
                 self._reject_if_truncated(result)
             raise
         if not content.strip():
+            # BEST EFFORT, and that is the whole design of this block.
+            # /api/generate is an OLLAMA route. A caller pointed at the
+            # LiteLLM proxy has no such route -- measured 2026-11-07, the
+            # proxy answers 404 to it both authenticated and not, exactly as
+            # it answers a path that does not exist. So the fallback's own
+            # failure must never become the caller's diagnosis: the empty
+            # response is the real finding, and a caller that cascades needs
+            # to see THAT and try its next tier.
+            #
+            # Before this, the 404 surfaced as httpx.HTTPStatusError, which is
+            # not an LLMError, so reflex's tier-1 -> tier-2 cascade was
+            # skipped entirely and a raw exception left the classifier.
             logger.debug("Empty response from chat completions, falling back to native API")
             native_payload: dict[str, Any] = {
                 "model": model,
@@ -230,12 +282,18 @@ class LLMClient:
             # Don't pass num_predict — thinking models (qwen3.5) consume
             # the token budget on thinking tokens, leaving nothing for
             # the visible answer. Let the model decide when to stop.
-            native_response = self.client.post(
-                f"{self.base_url}/api/generate",
-                json=native_payload,
-            )
-            native_response.raise_for_status()
-            native_result = native_response.json()
+            try:
+                native_response = self.client.post(
+                    f"{self.base_url}/api/generate",
+                    json=native_payload,
+                )
+                self._raise_for_status(native_response, "native generate")
+                native_result = native_response.json()
+            except (LLMError, httpx.RequestError) as e:
+                raise LLMError(
+                    f"empty response from chat completions, and the native "
+                    f"fallback did not answer: {type(e).__name__}"
+                ) from e
             result = {
                 "choices": [
                     {
