@@ -155,12 +155,8 @@ def test_the_boot_probe_runs_the_image_with_no_network():
 
 
 def test_the_negative_control_runs_the_same_probe():
-    """This is what makes the control cover the probe's OWN error handling.
-
-    The probe takes its tag as an argument so the control can run that exact
-    script against a deliberately broken image. Inlined in ci.yml, only the
-    good image ever runs the checks, so a weakening of them has nothing
-    watching.
+    """The probe takes its tag as an argument so the control can run that
+    exact script against a deliberately broken image.
     """
     live = [_without_comment(x) for x in _joined((REPO / ".github/workflows/ci.yml").read_text())]
 
