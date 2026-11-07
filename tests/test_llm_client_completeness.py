@@ -20,6 +20,8 @@ in the foodcam project, not re-measured here.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest import mock
 
 import httpx
@@ -477,12 +479,32 @@ class TestTheReturnTypeIsEnforcedNotJustAnnotated:
 
 
 class TestTheApiKeyReachesTheRequest:
-    """Asserted on the WIRE, not on the constructor: a header set in __init__
-    and dropped at a call site looks identical from __init__.
+    """Asserted on the outgoing request, not on the constructor: a header set
+    in __init__ and dropped at a call site looks identical from __init__.
     """
 
     @staticmethod
-    def _authorization_seen(client: LLMClient, path: str = "/v1/chat/completions") -> str | None:
+    @contextmanager
+    def _mock_transport(client: LLMClient, handler) -> Iterator[None]:
+        """Route the client's requests through `handler`.
+
+        Built from the REAL client's headers, so a constructor that stops
+        setting them leaves the handler seeing nothing.
+        """
+        original = client.client
+        client.client = httpx.Client(
+            transport=httpx.MockTransport(handler), headers=original.headers
+        )
+        try:
+            yield
+        finally:
+            client.client.close()
+            original.close()
+
+    @classmethod
+    def _authorization_seen(
+        cls, client: LLMClient, path: str = "/v1/chat/completions"
+    ) -> str | None:
         seen: dict[str, str | None] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -492,17 +514,8 @@ class TestTheApiKeyReachesTheRequest:
                 json={"choices": [{"message": {"content": '{"ok": 1}'}, "finish_reason": "stop"}]},
             )
 
-        # The client's own headers, not a fresh dict: if __init__ stops setting
-        # them, this transport sees nothing and the test fails.
-        original = client.client
-        client.client = httpx.Client(
-            transport=httpx.MockTransport(handler), headers=original.headers
-        )
-        try:
+        with cls._mock_transport(client, handler):
             client._post_completion(model="m", prompt="p", max_tokens=10)
-        finally:
-            client.client.close()
-            original.close()
         return seen.get(path)
 
     def test_a_key_is_sent_as_a_bearer_header(self):
@@ -518,31 +531,38 @@ class TestTheApiKeyReachesTheRequest:
         c = LLMClient("http://llm.test", api_key=blank)
         assert self._authorization_seen(c) is None
 
-    def test_a_blank_key_is_logged_without_echoing_it(self, capsys):
-        """A 401 does not say whether a credential was sent, so the one place
-        that knows has to say so. structlog writes to stdout, not through the
-        stdlib handlers caplog hooks -- caplog sees nothing here.
+    @pytest.mark.parametrize("padded", ["  sk-secret", "sk-secret\n", " sk-secret \t"])
+    def test_surrounding_whitespace_is_stripped(self, padded):
+        c = LLMClient("http://llm.test", api_key=padded)
+        assert self._authorization_seen(c) == "Bearer sk-secret"
 
-        The message is asserted WHOLE, not by keyword. A keyword assertion
-        survived a mutant that interpolated the key into this very line: the
-        branch that could leak a credential is the blank-key branch, and
-        test_a_real_key_is_never_logged cannot reach it.
+    @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
+    def test_a_blank_key_is_reported(self, blank, capsys):
+        """Including "", which an env var set to nothing produces.
+
+        structlog writes to stdout; caplog does not see it.
         """
-        LLMClient("http://llm.test", api_key="   ")
-        assert (
-            "api_key is blank or whitespace-only; sending no Authorization header"
-            in capsys.readouterr().out
-        )
+        LLMClient("http://llm.test", api_key=blank)
+        out = capsys.readouterr().out
+        assert "api_key is blank; sending no Authorization header" in out
+        # The value itself is never echoed, wherever a mutant might put it.
+        assert repr(blank) not in out
+
+    @pytest.mark.parametrize("fine", [None, "sk-secret"])
+    def test_a_usable_or_absent_key_is_silent(self, fine, capsys):
+        """No key at all is the normal direct-ollama configuration, and a
+        working key is the normal proxy one. Neither is a problem, so neither
+        gets a warning -- without this, a guard that warns on every
+        construction passes every other test here.
+        """
+        LLMClient("http://llm.test", api_key=fine)
+        captured = capsys.readouterr()
+        assert "blank" not in captured.out + captured.err
 
     def test_a_real_key_is_never_logged(self, capsys):
         LLMClient("http://llm.test", api_key="sk-secret")
         captured = capsys.readouterr()
         assert "sk-secret" not in captured.out + captured.err
-
-    @pytest.mark.parametrize("padded", ["  sk-secret", "sk-secret\n", " sk-secret \t"])
-    def test_surrounding_whitespace_is_stripped(self, padded):
-        c = LLMClient("http://llm.test", api_key=padded)
-        assert self._authorization_seen(c) == "Bearer sk-secret"
 
     def test_the_native_fallback_carries_the_key_too(self):
         """The /api/generate retry is a SECOND request, and a header added only
@@ -562,13 +582,8 @@ class TestTheApiKeyReachesTheRequest:
             )
 
         c = LLMClient("http://llm.test", api_key="sk-secret")
-        original = c.client
-        c.client = httpx.Client(transport=httpx.MockTransport(handler), headers=original.headers)
-        try:
+        with self._mock_transport(c, handler):
             c._post_completion(model="m", prompt="p", max_tokens=10, reject_truncated=False)
-        finally:
-            c.client.close()
-            original.close()
 
         paths = [p for p, _ in seen]
         assert any(p.endswith("/api/generate") for p in paths), paths

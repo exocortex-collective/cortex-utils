@@ -144,14 +144,19 @@ class LLMClient:
         Args:
             base_url: The endpoint root. No default: these repos are public.
             api_key: Sent as "Authorization: Bearer <key>" on every request.
-                Omit it for an endpoint that needs none. Blank or
-                whitespace-only is treated as absent, and logged, because a
-                401 does not say whether a credential was sent.
+                Omit it for an endpoint that needs none. A value that is
+                present but blank -- "" or whitespace -- is treated as absent
+                AND logged, because a 401 does not say whether a credential
+                was sent, and an env var set to nothing is the likeliest way
+                to get one.
         """
         self.base_url = base_url.rstrip("/")
         key = (api_key or "").strip()
-        if api_key and not key:
-            logger.warning("api_key is blank or whitespace-only; sending no Authorization header")
+        # `is not None`, not a truth test: "" is falsy, and "" -- an env var
+        # set to nothing -- is the likeliest misconfiguration of the two.
+        # A truth test here warned about "   " and stayed silent about "".
+        if api_key is not None and not key:
+            logger.warning("api_key is blank; sending no Authorization header")
         self.client = httpx.Client(
             timeout=120.0,
             headers={"Authorization": f"Bearer {key}"} if key else {},
