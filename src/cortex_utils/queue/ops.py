@@ -859,7 +859,7 @@ def claim(
             """,
             {"q": queue_name, "vis": visibility_timeout_min, "lim": limit, "w": worker},
         )
-        return [
+        claimed = [
             {
                 "id": r[0],
                 "queue_name": r[1],
@@ -888,6 +888,28 @@ def claim(
             }
             for r in cur.fetchall()
         ]
+
+    # `claimable` orders by (priority DESC, created_at), but this is an
+    # `UPDATE ... FROM claimable ... RETURNING`, and RETURNING order is the
+    # order rows were UPDATED, which Postgres does not promise matches the
+    # CTE's ORDER BY -- in practice it follows the join. So the statement
+    # selects the right rows and hands them back in an arbitrary order, and
+    # every caller works a batch by iterating this list.
+    #
+    # That is not a cosmetic difference. A consumer that cannot finish a whole
+    # batch inside its deadline releases the remainder, and release() is
+    # deliberately attempt-free, so a row that keeps landing in the unworked
+    # tail is re-claimed and re-released forever: attempts never increments,
+    # nothing retires it, nothing logs, and the only symptom is a queue count
+    # that does not move. Measured on 2026-11-07: 67 triage jobs at priority
+    # -50 sat unattempted for hours while LOWER-priority rows in the same
+    # batch completed beside them.
+    #
+    # Sorted here rather than in the SQL because the ordering is a property of
+    # the batch this function hands out, the values are already in each row,
+    # and it keeps the claim a single statement.
+    claimed.sort(key=lambda j: (-j["priority"], j["created_at"]))
+    return claimed
 
 
 def complete(
