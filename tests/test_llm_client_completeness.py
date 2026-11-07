@@ -613,11 +613,8 @@ class TestAnHttpFaultIsAnLLMError:
     LLMError -- so a caller branching on LLMError never saw it (utils-3258).
     """
 
-    # A body that PARSES. The first version of these tests answered the error
-    # status with {"detail": "nope"}, which has no "choices" -- so with the
-    # status check removed they still raised, on the unreadable shape, and
-    # passed while asserting nothing about the status at all. Two of them were
-    # vacuous against the fix they were written for.
+    # A body that PARSES, so the status check is the only thing that can
+    # raise. With an unparseable one these tests pass without the fix.
     GOOD_BODY = {"choices": [{"message": {"content": '{"ok": 1}'}, "finish_reason": "stop"}]}
 
     @classmethod
@@ -690,10 +687,7 @@ class TestAnHttpFaultIsAnLLMError:
 
     @pytest.mark.parametrize("status", [400, 403, 404, 413, 422, 431, 501, 505])
     def test_a_permanent_fault_is_not_retryable(self, status):
-        """413 and 431 and 501 and 505 are here because the first version
-        enumerated the permanent statuses and left them out, so an over-long
-        prompt rejected with 413 would have been retried.
-        """
+        """413, 431, 501 and 505 are the ones a status list tends to miss."""
         c = self._client_answering(status)
         try:
             with pytest.raises(LLMHTTPError) as caught:
@@ -704,10 +698,9 @@ class TestAnHttpFaultIsAnLLMError:
 
     @pytest.mark.parametrize("status", [301, 302, 307, 308])
     def test_a_redirect_is_an_llm_error_too(self, status):
-        """`is_error` is 4xx/5xx ONLY. The first version of the guard used it,
-        so a 3xx fell through to .json() and escaped as a raw JSONDecodeError
-        -- not an LLMError, so past every cascade. This client does not follow
-        redirects, so repeating the request just returns the redirect again.
+        """`is_error` is 4xx/5xx only, so a 3xx needs the is_success guard to
+        become an LLMError rather than a raw JSONDecodeError. Permanent: this
+        client does not follow redirects.
         """
         c = self._client_answering(status)
         try:
@@ -729,6 +722,7 @@ class TestAnHttpFaultIsAnLLMError:
         finally:
             c.client.close()
         assert "not JSON" in str(caught.value)
+        assert "chat completions" in str(caught.value), "which request failed"
 
     def test_the_fault_chains_the_original(self):
         """`from e` -- the httpx or ValueError cause stays reachable for a
@@ -794,6 +788,75 @@ class TestAnHttpFaultIsAnLLMError:
         finally:
             c.client.close()
         assert "empty response from chat completions" in str(caught.value)
+        # A CONNECTION failure is retryable, and httpx.RequestError has no
+        # `retryable`, so this is what the getattr default decides.
+        assert caught.value.retryable is True
+
+    def test_a_non_object_body_on_the_primary_path_is_an_llm_error(self):
+        """`null`, `[1]` and `"x"` are valid JSON. The object check was on the
+        native call site only, so a non-object here reached `result.get` in
+        _reject_if_truncated and escaped as a raw AttributeError.
+        """
+        for body in (b"null", b"[1]", b'"x"'):
+            c = self._client_answering(200, body=body)
+            try:
+                with pytest.raises(LLMError) as caught:
+                    self._post(c)
+            finally:
+                c.client.close()
+            assert "not an object" in str(caught.value), body
+
+    def test_a_non_json_body_on_the_native_path_is_an_llm_error(self):
+        """The native call used .json() bare, so dropping ValueError from its
+        except tuple survived every other test here.
+        """
+        c = self._client_answering(200, path="/api/generate", body=b"<html>no</html>")
+        try:
+            with pytest.raises(LLMError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "empty response from chat completions" in str(caught.value)
+        assert "native generate" in str(caught.value), "which request failed"
+
+    @pytest.mark.parametrize("status", [432, 451, 499])
+    def test_an_unlisted_4xx_is_not_retryable(self, status):
+        """Nothing between 432 and 499 was exercised, so `< 500` could have
+        been `< 499` unnoticed.
+        """
+        c = self._client_answering(status)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert caught.value.retryable is False
+
+    def test_a_401_through_a_public_method_keeps_its_status(self):
+        """No HTTP status went through a PUBLIC method in any test, so the
+        `except LLMError: raise` arm in each one could be deleted unnoticed --
+        and then `except Exception` would rewrap a 401 as a plain LLMError
+        with retryable defaulting to True.
+        """
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                c.check_intent("subj", "is this a thing?", "m")
+        finally:
+            c.client.close()
+        assert caught.value.status_code == 401
+        assert caught.value.retryable is False
+
+    def test_extract_value_still_swallows_an_http_fault(self):
+        """It returns None by design -- extraction is optional. The deleted
+        handler did that explicitly; the surviving `except LLMError` must do
+        the same.
+        """
+        c = self._client_answering(401)
+        try:
+            assert c.extract_value("a@b.test", "subj", "body", "p", "m") is None
+        finally:
+            c.client.close()
 
     def test_a_native_body_that_is_not_an_object_is_an_llm_error(self):
         """native_result.get would raise AttributeError on a list or a

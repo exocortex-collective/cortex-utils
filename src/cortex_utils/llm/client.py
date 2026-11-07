@@ -17,30 +17,21 @@ logger = get_logger(__name__)
 
 
 class LLMError(Exception):
-    """An LLM call failed in a way a caller can branch on.
-
-    HTTP faults and unreadable responses raise this from anywhere in the
-    module. A NETWORK fault does not: _post_completion lets
-    httpx.RequestError through, and only the six public methods convert it.
-    """
+    """An LLM call failed in a way a caller can branch on."""
 
     # Whether repeating the identical call could plausibly succeed.
     retryable: bool = True
 
 
-# A rule rather than a list: the first version enumerated the permanent
-# statuses and left out 413, 414, 415, 431, 501 and 505, so an over-long
-# prompt rejected with 413 would have been retried.
 _RETRYABLE_4XX = frozenset({408, 425, 429})
 _PERMANENT_5XX = frozenset({501, 505})
 
 
 def _is_retryable(status_code: int) -> bool:
     """Whether repeating the identical request could plausibly succeed."""
-    if status_code < 400:
-        # A 3xx this client never follows. Repeating it returns the redirect.
-        return False
     if status_code < 500:
+        # Also 1xx and 3xx, which are permanent here: the client does not
+        # follow redirects, so repeating one returns the redirect again.
         return status_code in _RETRYABLE_4XX
     return status_code not in _PERMANENT_5XX
 
@@ -52,8 +43,7 @@ class LLMHTTPError(LLMError):
     tier-2 cascade, for instance -- sees an HTTP fault at all. Raised as
     httpx.HTTPStatusError, it was invisible to such a caller.
 
-    `retryable` comes from the status. Nothing in this estate reads it yet;
-    LLMTruncatedError sets it for the same reason.
+    `retryable` comes from the status.
     """
 
     def __init__(self, message: str, status_code: int) -> None:
@@ -202,23 +192,33 @@ class LLMClient:
     @staticmethod
     def _raise_for_status(response: httpx.Response, where: str) -> None:
         """httpx's raise_for_status, as an LLMError a cascade can catch."""
-        # `not is_success`, NOT `is_error`: is_error is 4xx/5xx only, so a
-        # 3xx fell through to .json() and escaped as a raw JSONDecodeError --
-        # which is the very class of leak this helper exists to stop. The
-        # raise_for_status it replaces raised for every non-2xx.
+        # is_success, NOT is_error: is_error is 4xx/5xx only, so a 3xx would
+        # fall through to .json() and escape as a raw JSONDecodeError.
         if response.is_success:
             return
+        # Not logged here. extract_value treats an HTTP fault as optional and
+        # logs it at WARNING; a logger.error in this helper runs upstream of
+        # that choice, and the alerter matches on level=error.
         code = response.status_code
-        logger.error(f"{where} returned HTTP {code}")
         raise LLMHTTPError(f"{where} returned HTTP {code}", code)
 
     @staticmethod
-    def _json_or_raise(response: httpx.Response, where: str) -> Any:
-        """A 200 is not a promise of JSON -- a proxy can answer with HTML."""
+    def _json_or_raise(response: httpx.Response, where: str) -> dict[str, Any]:
+        """A 200 is not a promise of a JSON OBJECT.
+
+        A proxy can answer with HTML, and `null`, `[1]` and `"x"` are all
+        valid JSON. The object check was on the native call site only, so a
+        non-object from the primary one reached `result.get` in
+        _reject_if_truncated and escaped as a raw AttributeError -- past every
+        caller's cascade, which is the leak this whole module is fixing.
+        """
         try:
-            return response.json()
+            body = response.json()
         except ValueError as e:
             raise LLMError(f"{where} returned a body that is not JSON") from e
+        if not isinstance(body, dict):
+            raise LLMError(f"{where} returned JSON {type(body).__name__}, not an object")
+        return body
 
     def _post_completion(
         self,
@@ -302,13 +302,8 @@ class LLMClient:
                     json=native_payload,
                 )
                 self._raise_for_status(native_response, "native generate")
-                native_result = native_response.json()
-                if not isinstance(native_result, dict):
-                    raise LLMError(
-                        f"native generate returned JSON "
-                        f"{type(native_result).__name__}, not an object"
-                    )
-            except (LLMError, httpx.RequestError, ValueError) as e:
+                native_result = self._json_or_raise(native_response, "native generate")
+            except (LLMError, httpx.RequestError) as e:
                 # The STATUS, not just the type name: an operator cannot tell
                 # a 404 route from a 500 backend from "LLMHTTPError".
                 failed = LLMError(
