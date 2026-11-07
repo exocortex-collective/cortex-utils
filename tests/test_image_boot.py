@@ -30,9 +30,13 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 # refuse a legitimate /app/.venv/bin/<script>.
 VENV_BIN = "/app/.venv/bin/"
 
-# The image tag the CI smoke builds. Commands that run THIS are the ones that
-# must have no network; a future `docker run alpine ...` is none of our business.
+# The one place the container is actually run. Parameterised by tag so the
+# negative control can run it against a broken image; see the second test.
+SMOKE = "ci/smoke.sh"
+
+# The real image, and the deliberately broken one the control builds.
 CI_IMAGE = "utils:ci"
+BROKEN_IMAGE = "utils:broken"
 
 
 def _joined(text: str) -> list[str]:
@@ -83,7 +87,10 @@ def test_the_project_itself_is_installed_after_its_source_is_copied():
     `--no-install-project` reproduces the bug exactly, and an earlier version
     of this test accepted it.
     """
-    lines = (REPO / "Dockerfile").read_text().splitlines()
+    # _joined, not splitlines: a `uv sync` whose --no-install-project sits on
+    # a continuation line reads as a project-installing sync to a per-line
+    # scan, which is exactly the case this test exists to refuse.
+    lines = _joined((REPO / "Dockerfile").read_text())
 
     def first_index(pattern: str) -> int:
         for i, line in enumerate(lines):
@@ -108,29 +115,67 @@ def test_the_project_itself_is_installed_after_its_source_is_copied():
     )
 
 
-def test_ci_runs_the_image_with_no_network():
-    """A smoke that gives the container a network cannot catch this.
-
-    Select on `docker run` of OUR image, not on any `docker run`: a future
-    probe against some other image legitimately needs a network. And not on
-    the tag alone -- `docker build -t utils:ci .` carries the tag too.
-    """
-    ci = (REPO / ".github/workflows/ci.yml").read_text()
-    runs = [
-        c for c in (_without_comment(x) for x in _joined(ci)) if "docker run" in c and CI_IMAGE in c
-    ]
-    assert runs, (
-        f"no command in ci.yml runs {CI_IMAGE}, so nothing proves the image "
-        f"can start; did the smoke move or get deleted?"
-    )
+def test_the_boot_probe_runs_the_image_with_no_network():
+    """A probe that gives the container a network cannot catch this."""
+    script = (REPO / SMOKE).read_text()
+    runs = [c for c in (_without_comment(x) for x in _joined(script)) if "docker run" in c]
+    assert runs, f"{SMOKE} runs no container, so nothing proves the image starts"
     for cmd in runs:
         # `--network[= ]none`: both spellings work in docker, so refusing the
         # equals form would be a false positive on a working command.
         assert re.search(r"--network[= ]none", cmd), (
-            f"the CI image smoke gives the container a network, so it cannot "
+            f"the boot probe gives the container a network, so it cannot "
             f"catch a boot that needs one: {cmd.strip()}"
         )
         assert "--user" not in cmd, (
-            f"the smoke overrides the image's declared user, so it would not "
+            f"the probe overrides the image's declared user, so it would not "
             f"catch a regression to a root-only image: {cmd.strip()}"
         )
+
+    # The exit status alone is not enough, and this half is NOT covered by the
+    # negative control: the broken image dies at exec, so it is rejected
+    # whether or not the output is ever checked. An image that exits 0 without
+    # running the CLI is what this pins.
+    assert 'grep -q "Cortex operational utilities"' in script, (
+        f"{SMOKE} never checks what the container PRINTED, so an image that "
+        f"exits 0 without running the CLI would pass the probe"
+    )
+
+    # Measured: with `set +e` the probe still rejects the broken image, because
+    # its LAST command fails there -- so the negative control does not catch
+    # this one. It is the probe's only failure mechanism; there are no
+    # per-command handlers to fall back on.
+    # On a comment-stripped DIRECTIVE, not the file text: the script explains
+    # itself in a comment that mentions set -e, and a first draft of this
+    # assertion was satisfied by that comment while `set +e` was in force.
+    directives = [_without_comment(x).strip() for x in _joined(script)]
+    assert any(re.match(r"set\s+-[a-z]*e", d) for d in directives), (
+        f"{SMOKE} does not abort on error, so a failing check before the last "
+        f"one would not fail the probe"
+    )
+
+
+def test_the_negative_control_runs_the_same_probe():
+    """This is what makes the control cover the probe's OWN error handling.
+
+    The probe takes its tag as an argument so the control can run that exact
+    script against a deliberately broken image. While the checks were inlined
+    in ci.yml only the good image ever ran them, so a swallowed exit status or
+    a deleted grep weakened the probe with nothing to notice -- and successive
+    review rounds kept finding another spelling a lint did not know.
+    """
+    live = [_without_comment(x) for x in _joined((REPO / ".github/workflows/ci.yml").read_text())]
+
+    tags = {m for c in live if SMOKE in c for m in re.findall(r"utils:\S+", c)}
+    assert {CI_IMAGE, BROKEN_IMAGE} <= tags, (
+        f"ci.yml must run {SMOKE} against both {CI_IMAGE} and {BROKEN_IMAGE}, "
+        f"or the control does not exercise the probe itself; found {tags or 'none'}"
+    )
+
+    # And the image must not be run anywhere else. A second, inline definition
+    # of "it boots" is one the control does not cover.
+    stray = [c.strip() for c in live if "docker run" in c]
+    assert not stray, (
+        f"ci.yml runs a container directly rather than through {SMOKE}, so "
+        f"that check is outside the negative control: {stray}"
+    )
