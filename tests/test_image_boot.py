@@ -30,9 +30,9 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 
 # The one correct start command. Asserted whole rather than probed for
 # properties: there is exactly one right answer, so equality is both the
-# simplest assertion and the strongest. It rejects a boot-time `pip install`,
-# a `python -c` that shells out, and a `/app/.venv/bin/../../..` path that
-# escapes the venv, without needing to name any of them.
+# simplest assertion and the strongest. It rejects a boot-time `pip install`
+# and a `/app/.venv/bin/../../..` path that escapes the venv, without needing
+# to name either of them.
 EXPECTED_START = ["/app/.venv/bin/cortex-utils"]
 
 # The one place the container is actually run. Parameterised by tag so the
@@ -104,9 +104,8 @@ def test_the_container_starts_with_the_baked_venv():
     """The whole point: the start command must be the console script already
     built into the image, so nothing is resolved or fetched at boot.
 
-    This replaced a substring check for "/app/.venv/bin/" anywhere in the
-    command, which passed an `sh -c` wrapper and a trailing `#` comment. The
-    rules above and the cases at the bottom came from cortex-triage #97.
+    The rules above and the cases at the bottom came from cortex-triage #97;
+    re-sync from there if they change.
     """
     argv = _effective_argv((REPO / "Dockerfile").read_text())
     assert argv, "the Dockerfile declares no CMD or ENTRYPOINT"
@@ -141,11 +140,13 @@ def test_the_project_itself_is_installed_after_its_source_is_copied():
     installing = [
         i
         for i, line in enumerate(lines)
-        if re.search(r"^\s*RUN\s+uv\s+sync", line) and "--no-install-project" not in line
+        # Any --no-install-* flag disables it, not just --no-install-project:
+        # --no-install-package and --no-install-workspace do too.
+        if re.search(r"^\s*RUN\s+uv\s+sync", line) and "--no-install-" not in line
     ]
     assert installing, (
         "the Dockerfile never runs a `uv sync` that installs the project "
-        "itself -- every one carries --no-install-project"
+        "itself -- every one carries a --no-install-* flag"
     )
     assert any(i > copy_src for i in installing), (
         "every project-installing `uv sync` runs before `COPY src/`, so the "
@@ -276,6 +277,13 @@ RESOLUTION_CASES = [
     ("a bare JSON string", 'CMD "a"', ["/bin/sh", "-c", '"a"']),
     ("a JSON number", "CMD 42", ["/bin/sh", "-c", "42"]),
     ("a JSON object", 'CMD {"a": 1}', ["/bin/sh", "-c", '{"a": 1}']),
+    # Pins the line-continuation join: without it each half reads as a
+    # separate, unparseable instruction.
+    (
+        "an ENTRYPOINT split over continuation lines",
+        'ENTRYPOINT [ \\\n    "a", \\\n    "b"]',
+        ["a", "b"],
+    ),
     ("neither instruction", "RUN true", []),
 ]
 
