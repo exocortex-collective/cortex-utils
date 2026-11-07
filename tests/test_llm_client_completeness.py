@@ -879,6 +879,18 @@ class TestAnHttpFaultIsAnLLMError:
             c.client.close()
         assert "401 Unauthorized" in str(caught.value)
 
+    def test_a_status_with_no_reason_phrase_has_no_trailing_space(self):
+        """httpx gives "" for 599, so without the rstrip the message ends in
+        a space -- which reaches a log line and the alerter's dedup key.
+        """
+        c = self._client_answering(599)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert str(caught.value) == "chat completions returned HTTP 599"
+
     def test_an_http_fault_is_not_logged_at_error_by_the_library(self, capsys):
         """extract_value treats an HTTP fault as OPTIONAL and logs it at
         warning. A logger.error in _raise_for_status runs upstream of that
@@ -896,8 +908,12 @@ class TestAnHttpFaultIsAnLLMError:
         # (as the services do) and the console format otherwise (as the suite
         # does). Asserting only the JSON form made this test vacuous -- a
         # re-added logger.error survived it.
-        assert '"level": "error"' not in logged
-        assert "[error" not in logged
+        # CRITICAL as well as error: alerter/classifier.py's _LEVEL_FIELD
+        # matches `error|critical`, so pinning only error guards half of what
+        # this test claims to protect -- a logger.critical survived it.
+        for level in ("error", "critical"):
+            assert f'"level": "{level}"' not in logged
+            assert f"[{level}" not in logged
 
     def test_extract_value_still_swallows_an_http_fault(self):
         """It returns None by design -- extraction is optional. The deleted
