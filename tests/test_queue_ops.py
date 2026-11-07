@@ -203,19 +203,15 @@ def test_claim_recovers_under_budget_and_retires_only_exhausted() -> None:
 
 
 def test_claim_orders_by_priority_and_skips_locked() -> None:
-    """That the SELECT is ordered -- NOT that the batch comes back ordered.
-
-    This assertion passed throughout the starvation described in
-    test_claim_hands_back_the_batch_in_priority_order below, which is the
-    module docstring's point about substring assertions made concrete: the
-    statement said ORDER BY and the function returned the rows in the order
-    Postgres happened to update them. Keep both tests; this one pins which
-    rows are selected, that one pins the order they are handed out in.
+    """SQL shape only -- which rows are selected. The order they are handed
+    back in is pinned below, and this assertion passed while that was wrong.
     """
     conn = _conn(fetchall=[])
     claim(conn, "triage", WORKER)
     sql = conn.cur.executed[0][0]
-    assert "ORDER BY priority DESC, created_at" in sql
+    # `id` included: without it LIMIT picks an arbitrary N of a tie group, and
+    # production holds tie groups of 555 against a batch_size of 100.
+    assert "ORDER BY priority DESC, created_at, id" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
     # Partitioned tables key on (id, created_at); joining on id alone is wrong.
     assert "q.created_at = c.created_at" in sql
@@ -273,6 +269,32 @@ def test_claim_breaks_a_priority_tie_by_age() -> None:
     jobs = claim(conn, "triage", WORKER)
     assert [j["id"] for j in jobs] == [2, 1]
     assert [j["created_at"] for j in jobs] == [older, newer]
+
+
+def test_claim_breaks_a_created_at_tie_by_id() -> None:
+    """The case a bulk enqueue actually produces, and the reason `id` is in
+    the key at all.
+
+    created_at is NOW(), the transaction timestamp, so every row of one bulk
+    enqueue shares priority AND created_at. list.sort is stable, so on a
+    two-key sort such a group keeps whatever arbitrary order it arrived in --
+    which is the order this whole function exists to stop depending on.
+    Measured on the live triage queue 2026-11-07: 2647 rows at priority -200
+    held 6 distinct created_at values, the largest tie group 555 rows against
+    a batch_size of 100.
+
+    id is a shared sequence across partitions, so ordering by it is insertion
+    order, i.e. FIFO within the group.
+    """
+    conn = _conn(
+        fetchall=[
+            (9, "triage", {}, 0, -200, ROW_CREATED_AT),
+            (3, "triage", {}, 0, -200, ROW_CREATED_AT),
+            (7, "triage", {}, 0, -200, ROW_CREATED_AT),
+        ]
+    )
+    jobs = claim(conn, "triage", WORKER)
+    assert [j["id"] for j in jobs] == [3, 7, 9]
 
 
 def test_claim_returns_the_worker_facing_job_shape() -> None:
