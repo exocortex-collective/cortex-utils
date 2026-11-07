@@ -805,6 +805,7 @@ class TestAnHttpFaultIsAnLLMError:
             finally:
                 c.client.close()
             assert "not an object" in str(caught.value), body
+            assert "chat completions" in str(caught.value), "which request failed"
 
     def test_a_non_json_body_on_the_native_path_is_an_llm_error(self):
         """The native call used .json() bare, so dropping ValueError from its
@@ -832,20 +833,71 @@ class TestAnHttpFaultIsAnLLMError:
             c.client.close()
         assert caught.value.retryable is False
 
-    def test_a_401_through_a_public_method_keeps_its_status(self):
-        """No HTTP status went through a PUBLIC method in any test, so the
-        `except LLMError: raise` arm in each one could be deleted unnoticed --
-        and then `except Exception` would rewrap a 401 as a plain LLMError
-        with retryable defaulting to True.
-        """
+    # EVERY re-raising public method, not just one. Each has its own
+    # `except LLMError: raise` arm; patched independently, five of the six
+    # were unguarded against an HTTP status, and `except Exception` would
+    # then rewrap a 401 as a plain LLMError with retryable defaulting True.
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda c: c.check_intent("subj", "p", "m"), id="check_intent"),
+            pytest.param(lambda c: c.classify("p", "m"), id="classify"),
+            pytest.param(
+                lambda c: c.check_email_intent("a@b.test", "subj", "body", "p", "m"),
+                id="check_email_intent",
+            ),
+            pytest.param(
+                lambda c: c.categorize_email("a@b.test", "subj", "body", "p", "m", ["admin"]),
+                id="categorize_email",
+            ),
+            pytest.param(
+                lambda c: c.classify_with_extraction("p", "m"),
+                id="classify_with_extraction",
+            ),
+        ],
+    )
+    def test_a_401_through_a_public_method_keeps_its_status(self, call):
         c = self._client_answering(401)
         try:
             with pytest.raises(LLMHTTPError) as caught:
-                c.check_intent("subj", "is this a thing?", "m")
+                call(c)
         finally:
             c.client.close()
         assert caught.value.status_code == 401
         assert caught.value.retryable is False
+
+    def test_the_message_carries_the_reason_phrase(self):
+        """The alerter's severity patterns match on the TEXT: without
+        "Unauthorized" a 401 classifies as a generic LLM error rather than an
+        authentication failure (alerter/classifier.py).
+        """
+        c = self._client_answering(401)
+        try:
+            with pytest.raises(LLMHTTPError) as caught:
+                self._post(c)
+        finally:
+            c.client.close()
+        assert "401 Unauthorized" in str(caught.value)
+
+    def test_an_http_fault_is_not_logged_at_error_by_the_library(self, capsys):
+        """extract_value treats an HTTP fault as OPTIONAL and logs it at
+        warning. A logger.error in _raise_for_status runs upstream of that
+        choice, and the alerter matches level=error -- so re-adding one would
+        alert on every optional extraction failure.
+        """
+        c = self._client_answering(401)
+        try:
+            assert c.extract_value("a@b.test", "subj", "body", "p", "m") is None
+        finally:
+            c.client.close()
+        out = capsys.readouterr()
+        logged = out.out + out.err
+        # BOTH renderers: structlog emits JSON once configure_logging has run
+        # (as the services do) and the console format otherwise (as the suite
+        # does). Asserting only the JSON form made this test vacuous -- a
+        # re-added logger.error survived it.
+        assert '"level": "error"' not in logged
+        assert "[error" not in logged
 
     def test_extract_value_still_swallows_an_http_fault(self):
         """It returns None by design -- extraction is optional. The deleted

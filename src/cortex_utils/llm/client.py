@@ -198,19 +198,21 @@ class LLMClient:
             return
         # Not logged here. extract_value treats an HTTP fault as optional and
         # logs it at WARNING; a logger.error in this helper runs upstream of
-        # that choice, and the alerter matches on level=error.
+        # that choice, and the alerter matches level=error
+        # (alerter/classifier.py, _LEVEL_FIELD).
+        #
+        # The REASON PHRASE is in the message because the alerter's severity
+        # patterns match on the TEXT: without "Unauthorized" a 401 fell from
+        # CRITICAL "Authentication Failed" to a generic HIGH "LLM Error".
         code = response.status_code
-        raise LLMHTTPError(f"{where} returned HTTP {code}", code)
+        raise LLMHTTPError(f"{where} returned HTTP {code} {response.reason_phrase}".rstrip(), code)
 
     @staticmethod
     def _json_or_raise(response: httpx.Response, where: str) -> dict[str, Any]:
         """A 200 is not a promise of a JSON OBJECT.
 
         A proxy can answer with HTML, and `null`, `[1]` and `"x"` are all
-        valid JSON. The object check was on the native call site only, so a
-        non-object from the primary one reached `result.get` in
-        _reject_if_truncated and escaped as a raw AttributeError -- past every
-        caller's cascade, which is the leak this whole module is fixing.
+        valid JSON while having no `.get`.
         """
         try:
             body = response.json()
