@@ -902,16 +902,10 @@ def claim(
     # SILENT: a row left in the unworked tail increments nothing and logs
     # nothing, so the only symptom is a queue count that does not move.
     #
-    # Measured on 2026-11-07, twice about fifty minutes apart: in a 75s window
-    # the -50 band completed 0 while the LOWER-priority -100 band completed 5,
-    # and in a 90s window -50 completed 0 while -100 completed 4. 67 rows at
-    # -50 sat with attempts=0 for over two hours.
-    #
-    # What was NOT measured, and an earlier version of this comment asserted:
-    # that such a row starves forever. It does not -- the same -50 band
-    # drained 628 -> 671 between those two windows. Work comes out in bursts
-    # and WHICH band progresses in a given window is arbitrary. Episodic
-    # inversion, not indefinite starvation.
+    # Measured on 2026-11-07, in two windows about fifty minutes apart: the
+    # -50 band completed nothing while the LOWER-priority -100 band completed
+    # work beside it, and 67 rows at -50 sat with attempts=0 for over two
+    # hours. Whether such a row is ever stuck for good was not tested.
     #
     # `id` is the third key in BOTH orderings, and it is load-bearing rather
     # than tidiness. created_at is NOW(), the transaction timestamp, so one
