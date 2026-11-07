@@ -537,11 +537,20 @@ class TestTheApiKeyReachesTheRequest:
         assert self._authorization_seen(c) == "Bearer sk-secret"
 
     @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
-    def test_a_blank_key_is_reported(self, blank, capsys):
+    # The trailing slash is the point of the second case: the message must
+    # carry the NORMALISED base_url, so a mutant logging the raw argument
+    # rather than self.base_url is caught.
+    @pytest.mark.parametrize("url", ["http://llm.test", "http://llm.test/"])
+    def test_a_blank_key_is_reported(self, blank, url, capsys):
         """Including "", which an env var set to nothing produces."""
-        LLMClient("http://llm.test", api_key=blank)
+        LLMClient(url, api_key=blank)
         out = capsys.readouterr().out
         assert "api_key is blank; sending no Authorization header to http://llm.test" in out
+        # NOT the raw argument. A substring check alone cannot tell the two
+        # apart, because the normalised URL is a prefix of the slashed one --
+        # which is why the first version of this case did not kill the mutant
+        # that logs `base_url` instead of `self.base_url`.
+        assert "header to http://llm.test/" not in out
         # In repr form only. A mutant appending the raw value survives, and
         # only blank values reach this branch, so that is left alone.
         assert repr(blank) not in out
