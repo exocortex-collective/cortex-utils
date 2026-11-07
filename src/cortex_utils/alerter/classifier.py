@@ -134,7 +134,8 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
         Severity.HIGH,
         10,
         "LLM Error",
-        "Ollama/LLM request failed. Classification may fall back to rules.",
+        "Ollama/LLM request failed. Affected mail is retried, then "
+        "dead-lettered UNCLASSIFIED -- it is not rules-classified.",
     ),
     # === WARNING (aggregate for daily summary) ===
     (

@@ -18,6 +18,10 @@ import structlog
 
 from cortex_utils import backfill_walker as bw
 from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
+from cortex_utils.alerter.rate_limiter import (
+    DEFAULT_ESCALATE_AFTER_MINUTES,
+    DEFAULT_ESCALATE_AFTER_OCCURRENCES,
+)
 from cortex_utils.config import Config
 from cortex_utils.health.watchdog import Watchdog, parse_peers
 from cortex_utils.log import get_logger
@@ -667,12 +671,26 @@ def alerter() -> None:
 )
 @click.option("--no-ping", is_flag=True, help="Don't @here on critical alerts")
 @click.option("--summary-hour", default=6, type=int, help="Hour (0-23) to send daily summary")
+@click.option(
+    "--escalate-after",
+    default=DEFAULT_ESCALATE_AFTER_MINUTES,
+    type=int,
+    help="Minutes a HIGH error must keep firing before it is sent as CRITICAL (0 disables)",
+)
+@click.option(
+    "--escalate-occurrences",
+    default=DEFAULT_ESCALATE_AFTER_OCCURRENCES,
+    type=int,
+    help="Occurrences required alongside --escalate-after, so a one-second burst is not an outage",
+)
 @click.pass_context
 def alerter_run(
     ctx: click.Context,
     containers: tuple[str, ...],
     no_ping: bool,
     summary_hour: int,
+    escalate_after: int,
+    escalate_occurrences: int,
 ) -> None:
     """Run the alerter daemon.
 
@@ -687,6 +705,13 @@ def alerter_run(
     click.echo(f"  Containers: {container_list or 'all cortex-* containers'}")
     click.echo(f"  Ping on critical: {not no_ping}")
     click.echo(f"  Daily summary at: {summary_hour:02d}:00")
+    if escalate_after > 0:
+        click.echo(
+            f"  Escalate to CRITICAL after: {escalate_after}m "
+            f"and {escalate_occurrences} occurrences"
+        )
+    else:
+        click.echo("  Escalate to CRITICAL: disabled")
     click.echo("")
 
     run_alerter(
@@ -694,6 +719,8 @@ def alerter_run(
         containers=container_list,
         ping_critical=not no_ping,
         summary_hour=summary_hour,
+        escalate_after_minutes=escalate_after,
+        escalate_after_occurrences=escalate_occurrences,
     )
 
 
