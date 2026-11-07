@@ -84,8 +84,7 @@ def test_the_project_itself_is_installed_after_its_source_is_copied():
     without fixing this yields ModuleNotFoundError.
 
     A sync after the COPY is not enough on its own: one carrying
-    `--no-install-project` reproduces the bug exactly, and an earlier version
-    of this test accepted it.
+    `--no-install-project` reproduces the bug exactly.
     """
     # _joined, not splitlines: a `uv sync` whose --no-install-project sits on
     # a continuation line reads as a project-installing sync to a per-line
@@ -146,8 +145,8 @@ def test_the_boot_probe_runs_the_image_with_no_network():
     # this one. It is the probe's only failure mechanism; there are no
     # per-command handlers to fall back on.
     # On a comment-stripped DIRECTIVE, not the file text: the script explains
-    # itself in a comment that mentions set -e, and a first draft of this
-    # assertion was satisfied by that comment while `set +e` was in force.
+    # itself in a comment that mentions set -e, which satisfies a naive
+    # substring check while `set +e` is in force.
     directives = [_without_comment(x).strip() for x in _joined(script)]
     assert any(re.match(r"set\s+-[a-z]*e", d) for d in directives), (
         f"{SMOKE} does not abort on error, so a failing check before the last "
@@ -159,10 +158,9 @@ def test_the_negative_control_runs_the_same_probe():
     """This is what makes the control cover the probe's OWN error handling.
 
     The probe takes its tag as an argument so the control can run that exact
-    script against a deliberately broken image. While the checks were inlined
-    in ci.yml only the good image ever ran them, so a swallowed exit status or
-    a deleted grep weakened the probe with nothing to notice -- and successive
-    review rounds kept finding another spelling a lint did not know.
+    script against a deliberately broken image. Inlined in ci.yml, only the
+    good image ever runs the checks, so a weakening of them has nothing
+    watching.
     """
     live = [_without_comment(x) for x in _joined((REPO / ".github/workflows/ci.yml").read_text())]
 
@@ -174,7 +172,7 @@ def test_the_negative_control_runs_the_same_probe():
 
     # And the image must not be run anywhere else. A second, inline definition
     # of "it boots" is one the control does not cover.
-    stray = [c.strip() for c in live if "docker run" in c]
+    stray = [c.strip() for c in live if re.search(r"docker\s+(?:container\s+)?run", c)]
     assert not stray, (
         f"ci.yml runs a container directly rather than through {SMOKE}, so "
         f"that check is outside the negative control: {stray}"

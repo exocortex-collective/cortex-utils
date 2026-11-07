@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 # Boot probe for a built image, parameterised by tag.
 #
-# The tag is an ARGUMENT so the negative control in ci.yml can run this exact
-# script against a deliberately broken image. That is the whole point of the
-# file existing: while these checks lived inline in ci.yml, only the good
-# image ever ran them, so a swallowed exit status or a deleted grep weakened
-# the probe with nothing to notice. Weaken anything here now and the control
-# passes when it must fail.
+# The tag is an ARGUMENT so ci.yml's negative control can run this exact
+# script against a deliberately broken image.
 #
 # set -e carries the failures, so there is no per-command handler to swallow.
 set -euo pipefail
