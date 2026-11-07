@@ -1275,8 +1275,7 @@ class TestSustainedErrorsEscalate:
 
         `started` feeds the "failing for N minutes" line in the alert and
         `count` the occurrence count, so resetting either would misreport the
-        outage. Nothing reads them after escalation today, which is why this
-        was unpinned.
+        outage.
         """
         from datetime import datetime, timedelta
 
@@ -1496,13 +1495,8 @@ class TestTheDaemonIsWiredToTheRunTracker:
 
 
 class TestTheEscalationConfigReachesTheDaemon:
-    """The CLI and `run_alerter` plumbing, which had no test at all.
-
-    Round 1 found that hardcoding the values in `run_alerter`, hardcoding them
-    in `cli.py`, or setting either default to 0 all stayed green. The option is
-    the only thing that makes the flag work, so the mapping is worth a test
-    even though it is glue.
-    """
+    """The CLI and `run_alerter` plumbing: the option-to-kwarg mapping is the
+    only thing that makes the flag work."""
 
     def test_run_alerter_forwards_both_knobs(self):
         from cortex_utils.alerter import daemon as daemon_mod
