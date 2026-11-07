@@ -36,10 +36,11 @@ def is_sustained(
 ) -> bool:
     """Has this run been going long enough, and often enough, to escalate?
 
-    Both bounds must be met: duration alone
-    would escalate a single error seen once an hour ago and never again, and
-    count alone would escalate a burst of three lines in one second, which is
-    one event rather than a sustained one.
+    Both bounds must be met: duration alone would escalate a single error seen
+    once an hour ago and never again, and count alone would escalate a burst of
+    three lines in one second, which is one event rather than a sustained one.
+    An already-escalated run never escalates twice; only a quiet gap long
+    enough to start a new run can ping again.
     """
     if run is None or run.escalated:
         return False
