@@ -4,25 +4,29 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-# A key that keeps firing is a DIFFERENT event from a key that fired once, and
-# the cooldown below cannot tell them apart -- it suppresses repeats, so a
-# multi-day outage looks exactly like a single blip. These bound the
-# "still happening" judgement; see is_sustained.
+# The cooldown below suppresses repeats, so a multi-day outage looks exactly
+# like a single blip. These bound the "still happening" judgement; see
+# is_sustained.
 DEFAULT_ESCALATE_AFTER_MINUTES = 30
 DEFAULT_ESCALATE_AFTER_OCCURRENCES = 3
-# How long a key must be quiet before the next occurrence starts a NEW run.
-# Without this, a key that fired in July and again in November reads as having
-# been "sustained for four months".
+# How long a key must be quiet before the next occurrence starts a NEW run,
+# so a key seen in July and again in November is two events and not one.
 DEFAULT_RUN_GAP_MINUTES = 60
 
 
 @dataclass(frozen=True)
 class Run:
-    """One unbroken stretch of the same error_key firing."""
+    """One unbroken stretch of the same error_key firing.
+
+    `escalated` is what makes one outage ping ONCE. Forgetting the run instead
+    re-escalates every escalate_after_minutes for as long as the outage lasts:
+    measured at 3 pings in 12 occurrences, hundreds over a multi-day outage.
+    """
 
     started: datetime
     last: datetime
     count: int
+    escalated: bool = False
 
 
 def is_sustained(
@@ -33,14 +37,12 @@ def is_sustained(
 ) -> bool:
     """Has this run been going long enough, and often enough, to escalate?
 
-    A pure function of the state, with no I/O and no clock of its own, because
-    it is a decision over four inputs and those are the ones that get tested
-    case-by-case and miss a cell. Both bounds must be met: duration alone
+    Both bounds must be met: duration alone
     would escalate a single error seen once an hour ago and never again, and
     count alone would escalate a burst of three lines in one second, which is
     one event rather than a sustained one.
     """
-    if run is None:
+    if run is None or run.escalated:
         return False
     if run.count < escalate_after_occurrences:
         return False
@@ -96,9 +98,7 @@ class RateLimiter:
     ) -> Run:
         """Record that this error_key just fired, and return its current run.
 
-        Called on EVERY occurrence, including ones the cooldown will then
-        suppress -- that is the whole point, since the suppressed ones are the
-        evidence that an outage is sustained.
+        Called on EVERY occurrence, including ones the cooldown then suppresses.
         """
         now = now or datetime.now()
         gap = DEFAULT_RUN_GAP_MINUTES if run_gap_minutes is None else run_gap_minutes
@@ -106,17 +106,26 @@ class RateLimiter:
         if prev is None or (now - prev.last) > timedelta(minutes=gap):
             run = Run(started=now, last=now, count=1)
         else:
-            run = Run(started=prev.started, last=now, count=prev.count + 1)
+            run = Run(
+                started=prev.started,
+                last=now,
+                count=prev.count + 1,
+                escalated=prev.escalated,
+            )
         self.runs[error_key] = run
         return run
 
-    def clear_run(self, error_key: str) -> None:
-        """Forget this key's run, so the next occurrence starts a fresh one.
+    def mark_escalated(self, error_key: str) -> None:
+        """Record that this run has already pinged, so it will not ping again.
 
-        Called after escalating, so one sustained outage pings once rather than
-        on every line for as long as it lasts.
+        The run keeps accumulating -- the outage is still happening and the
+        HIGH alerts keep posting on their own cooldown -- but it cannot
+        re-escalate. Only a quiet gap longer than the run gap, which starts a
+        fresh run, makes another ping possible.
         """
-        self.runs.pop(error_key, None)
+        prev = self.runs.get(error_key)
+        if prev is not None:
+            self.runs[error_key] = Run(prev.started, prev.last, prev.count, escalated=True)
 
     def increment_warning(self, error_key: str, sample: str = "") -> None:
         """Increment warning count for daily summary aggregation.

@@ -1105,15 +1105,8 @@ class TestTheTestAlertNamesWhatItWouldWatch:
 class TestSustainedErrorsEscalate:
     """A multi-day outage must not look like a single blip.
 
-    cortex-rao8: Ollama was unreachable for 8 days in two windows, dead-lettering
-    315 triage jobs. The alerter detected EVERY error and posted every one with
-    ping=False, because only CRITICAL pings and the LLM pattern maps to HIGH.
-    The cooldown then suppressed the repeats, so the whole outage was
-    indistinguishable from one transient failure.
-
-    The decision is a pure function of four inputs, so these enumerate the input
-    space rather than sampling it -- a five-dimensional decision tangled with
-    I/O is what shipped the same P1 three times in cortex-school's post_discord.
+    The decision is a pure function of four inputs, so these enumerate the
+    input space rather than sampling it.
     """
 
     @staticmethod
@@ -1193,7 +1186,78 @@ class TestSustainedErrorsEscalate:
         assert run.count == 10
         assert is_sustained(run, t0 + timedelta(minutes=270), 30, 3) is True
 
-    def test_clearing_the_run_means_one_ping_per_outage(self):
+    def test_the_escalation_defaults_are_in_a_useful_band(self):
+        """The defaults are the whole behaviour for the one live consumer.
+
+        The deployed alerter passes neither flag, so whatever these say is what
+        production does. A 300-minute default means a 5-hour outage still has
+        not pinged; a 30-occurrence default means a service failing slowly
+        never escalates at all. Both stayed green before this test.
+        """
+        from cortex_utils.alerter.rate_limiter import (
+            DEFAULT_ESCALATE_AFTER_MINUTES,
+            DEFAULT_ESCALATE_AFTER_OCCURRENCES,
+        )
+
+        assert 5 <= DEFAULT_ESCALATE_AFTER_MINUTES <= 60, (
+            f"{DEFAULT_ESCALATE_AFTER_MINUTES} minutes is outside the band where "
+            "escalation is both prompt enough to matter and slow enough not to "
+            "fire on a blip"
+        )
+        assert 2 <= DEFAULT_ESCALATE_AFTER_OCCURRENCES <= 10, (
+            f"{DEFAULT_ESCALATE_AFTER_OCCURRENCES} occurrences is outside the band "
+            "where the floor excludes a burst without excluding a slow failure"
+        )
+
+    def test_the_run_gap_boundary_is_exclusive(self):
+        """A quiet period of exactly the gap CONTINUES the run; one minute more
+        starts a new one. Pins `>` rather than `>=`."""
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import RateLimiter
+
+        t0 = datetime(2026, 7, 1, 12, 0, 0)
+        rl = RateLimiter()
+        rl.note_occurrence("k", now=t0, run_gap_minutes=60)
+        exactly = rl.note_occurrence("k", now=t0 + timedelta(minutes=60), run_gap_minutes=60)
+        assert exactly.count == 2, "a gap of exactly the limit continues the run"
+
+        rl2 = RateLimiter()
+        rl2.note_occurrence("k", now=t0, run_gap_minutes=60)
+        over = rl2.note_occurrence("k", now=t0 + timedelta(minutes=61), run_gap_minutes=60)
+        assert over.count == 1, "one minute past the limit starts a new run"
+
+    def test_the_default_run_gap_is_used_when_none_is_passed(self):
+        """Every other test passes run_gap_minutes explicitly, so the default
+        itself was never exercised -- a default of 1 or 100000 stayed green."""
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import (
+            DEFAULT_RUN_GAP_MINUTES,
+            RateLimiter,
+        )
+
+        assert 10 <= DEFAULT_RUN_GAP_MINUTES <= 240, (
+            f"a run gap of {DEFAULT_RUN_GAP_MINUTES} minutes is not a plausible "
+            "quiet period for an outage"
+        )
+        t0 = datetime(2026, 7, 1, 12, 0, 0)
+        rl = RateLimiter()
+        rl.note_occurrence("k", now=t0)
+        inside = rl.note_occurrence("k", now=t0 + timedelta(minutes=DEFAULT_RUN_GAP_MINUTES - 1))
+        assert inside.count == 2, "inside the default gap must extend the run"
+        rl2 = RateLimiter()
+        rl2.note_occurrence("k", now=t0)
+        outside = rl2.note_occurrence("k", now=t0 + timedelta(minutes=DEFAULT_RUN_GAP_MINUTES + 1))
+        assert outside.count == 1, "outside the default gap must start a new run"
+
+    def test_an_escalated_run_never_escalates_twice(self):
+        """One ping per outage, and the mechanism that achieves it.
+
+        Forgetting the run instead re-escalates every escalate_after_minutes
+        for as long as the outage lasts -- 3 pings in 12 occurrences when
+        measured, hundreds over the 8-day outage this ticket is about.
+        """
         from datetime import datetime, timedelta
 
         from cortex_utils.alerter.rate_limiter import RateLimiter, is_sustained
@@ -1201,19 +1265,35 @@ class TestSustainedErrorsEscalate:
         rl = RateLimiter()
         t0 = datetime(2026, 7, 24, 15, 20, 0)
         for i in range(5):
+            run = rl.note_occurrence("k", now=t0 + timedelta(minutes=15 * i), run_gap_minutes=60)
+        assert is_sustained(run, t0 + timedelta(minutes=60), 30, 3) is True
+        rl.mark_escalated("k")
+        # The outage continues; it must not ping again.
+        for i in range(5, 20):
+            run = rl.note_occurrence("k", now=t0 + timedelta(minutes=15 * i), run_gap_minutes=60)
+            assert run.escalated is True
+            assert is_sustained(run, t0 + timedelta(minutes=15 * i), 30, 3) is False
+
+    def test_a_new_run_after_a_quiet_gap_can_escalate_again(self):
+        """A genuinely new outage is a new event and must ping."""
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import RateLimiter, is_sustained
+
+        rl = RateLimiter()
+        t0 = datetime(2026, 7, 24, 15, 20, 0)
+        for i in range(4):
             rl.note_occurrence("k", now=t0 + timedelta(minutes=15 * i), run_gap_minutes=60)
-        rl.clear_run("k")
-        run = rl.note_occurrence("k", now=t0 + timedelta(minutes=80), run_gap_minutes=60)
-        assert run.count == 1
-        assert is_sustained(run, t0 + timedelta(minutes=80), 30, 3) is False
+        rl.mark_escalated("k")
+        later = t0 + timedelta(days=3)
+        for i in range(4):
+            run = rl.note_occurrence("k", now=later + timedelta(minutes=15 * i), run_gap_minutes=60)
+        assert run.escalated is False, "a fresh run must not inherit the escalated flag"
+        assert is_sustained(run, later + timedelta(minutes=60), 30, 3) is True
 
     def test_a_sustained_high_error_pings_and_a_blip_does_not(self):
-        """Drives the real daemon entry point, not the rate limiter.
-
-        The acceptance criterion on cortex-rao8 is about what reaches Discord,
-        so this asserts on send_embed's ping argument rather than on internal
-        state.
-        """
+        """Drives the real daemon entry point, asserting on what reaches
+        Discord rather than on internal state."""
         from cortex_utils.alerter.daemon import AlerterDaemon
 
         with mock.patch("cortex_utils.alerter.daemon.DiscordClient") as dc:
@@ -1256,11 +1336,215 @@ class TestSustainedErrorsEscalate:
             assert any("CRITICAL" in t and "sustained" in t for t in titles), titles
 
     def test_the_llm_description_does_not_claim_a_rules_fallback(self):
-        """The secondary bug in cortex-rao8. On LLM error the job raises,
-        retries 3x and dead-letters with no classification row, so the mail is
-        unlabelled -- not rules-classified. The old text said otherwise."""
+        """On LLM error the job raises, retries and dead-letters with no
+        classification row, so the mail is unlabelled, not rules-classified."""
         c = classify("cortex-triage-worker", "ERROR Ollama error: No route to host")
         assert c is not None
         assert c.severity == Severity.HIGH
         assert "fall back to rules" not in c.description
         assert "dead-lettered" in c.description.lower()
+
+
+class _Clock:
+    """A controllable `datetime.now()` for the two modules that read the wall clock.
+
+    The daemon and the rate limiter both call `datetime.now()` internally, so
+    driving the daemon across simulated time means patching the `datetime` name
+    in both. Patching only `rate_limiter`'s would leave the daemon's own
+    `now` real, and the two would disagree by however long the test took.
+    """
+
+    def __init__(self, start):
+        self.t = start
+
+    def advance(self, **kw):
+        from datetime import timedelta
+
+        self.t += timedelta(**kw)
+
+    def now(self, tz=None):
+        return self.t
+
+
+class TestTheDaemonIsWiredToTheRunTracker:
+    """The wiring, which the unit tests above do NOT cover.
+
+    The daemon could stop calling `note_occurrence`, stop marking a run
+    escalated, post both embeds, or ignore the disable guard, and the unit
+    tests above would all still pass. These drive the real
+    `_process_log_line` over simulated time, with nothing backdated by hand.
+    """
+
+    LINE = "ERROR Ollama error: Server disconnected without sending a response"
+
+    @staticmethod
+    def _daemon(clock, **kw):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient") as dc:
+            d = AlerterDaemon(
+                "https://discord.test/hook", containers=["cortex-triage-worker"], **kw
+            )
+            return d, dc.return_value
+
+    def _feed(self, d, clock, times, step_minutes):
+        """Feed the same line `times` times, `step_minutes` apart."""
+        with (
+            mock.patch("cortex_utils.alerter.daemon.datetime", clock),
+            mock.patch("cortex_utils.alerter.rate_limiter.datetime", clock),
+        ):
+            for _ in range(times):
+                d._process_log_line("cortex-triage-worker", self.LINE)
+                clock.advance(minutes=step_minutes)
+
+    @staticmethod
+    def _pings(client):
+        return [c.kwargs.get("ping") for c in client.send_embed.call_args_list]
+
+    @staticmethod
+    def _titles(client):
+        return [c.kwargs.get("title", "") for c in client.send_embed.call_args_list]
+
+    def test_a_sustained_outage_pings_exactly_once(self):
+        """Pins `note_occurrence`, `clear_run`, and the elif, all at once.
+
+        Without `note_occurrence` no run accumulates and nothing ever pings.
+        Without `clear_run` every line past the threshold pings again. With
+        `if` instead of `elif` the escalation also posts the old Warning embed.
+        """
+        from datetime import datetime
+
+        clock = _Clock(datetime(2026, 7, 24, 15, 20, 0))
+        d, client = self._daemon(clock, escalate_after_minutes=30, escalate_after_occurrences=3)
+        # 12 occurrences over 2h, 11 minutes apart: past the 10-minute cooldown
+        # on the LLM Error pattern, so each one is also eligible to post.
+        self._feed(d, clock, times=12, step_minutes=11)
+
+        pings = self._pings(client)
+        assert pings.count(True) == 1, (
+            f"a sustained outage must ping exactly once, got {pings.count(True)}: {pings}"
+        )
+        titles = self._titles(client)
+        sustained = [x for x in titles if "sustained" in x]
+        assert len(sustained) == 1, f"exactly one sustained embed expected: {titles}"
+        # ONE embed per occurrence, never two. 12 occurrences 11 minutes apart
+        # all clear the 10-minute cooldown, so each posts exactly once; a 13th
+        # embed means the escalating occurrence ALSO posted the old Warning,
+        # which is what `if` instead of `elif` does.
+        assert len(titles) == 12, f"expected one embed per occurrence, got {len(titles)}: {titles}"
+
+    def test_escalation_waits_for_both_bounds_in_the_daemon(self):
+        """Three occurrences inside one minute must not ping.
+
+        Pins the duration bound at the daemon, not just in `is_sustained`.
+        """
+        from datetime import datetime
+
+        clock = _Clock(datetime(2026, 7, 24, 15, 20, 0))
+        d, client = self._daemon(clock, escalate_after_minutes=30, escalate_after_occurrences=3)
+        self._feed(d, clock, times=5, step_minutes=0)
+        assert True not in self._pings(client), (
+            f"a burst inside one instant is one event, not an outage: {self._pings(client)}"
+        )
+
+    def test_escalate_after_zero_disables_escalation(self):
+        """Pins the `> 0` guard. `or` instead of `and`, or `>= 0` instead of
+        `> 0`, both ship escalation ON when it was asked to be off."""
+        from datetime import datetime
+
+        clock = _Clock(datetime(2026, 7, 24, 15, 20, 0))
+        d, client = self._daemon(clock, escalate_after_minutes=0, escalate_after_occurrences=3)
+        self._feed(d, clock, times=12, step_minutes=11)
+        pings = self._pings(client)
+        assert pings, "disabling escalation must not disable alerting"
+        assert True not in pings, f"--escalate-after 0 must never ping: {pings}"
+
+    def test_a_quiet_gap_resets_the_run_in_the_daemon(self):
+        """Two occurrences either side of a long quiet period are two events.
+
+        Pins that the daemon's calls really do go through the gap logic, and
+        not merely that `note_occurrence` has it.
+        """
+        from datetime import datetime
+
+        clock = _Clock(datetime(2026, 7, 24, 15, 20, 0))
+        d, client = self._daemon(clock, escalate_after_minutes=30, escalate_after_occurrences=3)
+        self._feed(d, clock, times=2, step_minutes=11)
+        clock.advance(hours=6)
+        self._feed(d, clock, times=2, step_minutes=11)
+        assert True not in self._pings(client), (
+            "two short bursts six hours apart are not a sustained outage"
+        )
+
+
+class TestTheEscalationConfigReachesTheDaemon:
+    """The CLI and `run_alerter` plumbing, which had no test at all.
+
+    Round 1 found that hardcoding the values in `run_alerter`, hardcoding them
+    in `cli.py`, or setting either default to 0 all stayed green. The option is
+    the only thing that makes the flag work, so the mapping is worth a test
+    even though it is glue.
+    """
+
+    def test_run_alerter_forwards_both_knobs(self):
+        from cortex_utils.alerter import daemon as daemon_mod
+
+        seen = {}
+
+        class _Spy:
+            def __init__(self, *a, **kw):
+                seen.update(kw)
+
+            def run(self):
+                pass
+
+        with mock.patch.object(daemon_mod, "AlerterDaemon", _Spy):
+            daemon_mod.run_alerter(
+                webhook_url="https://discord.test/hook",
+                escalate_after_minutes=7,
+                escalate_after_occurrences=11,
+            )
+        assert seen.get("escalate_after_minutes") == 7, seen
+        assert seen.get("escalate_after_occurrences") == 11, seen
+
+    def test_the_cli_options_reach_the_daemon(self):
+        from click.testing import CliRunner
+
+        from cortex_utils import cli as cli_mod
+
+        seen = {}
+
+        def _spy(**kw):
+            seen.update(kw)
+
+        with mock.patch.object(cli_mod, "run_alerter", _spy):
+            res = CliRunner().invoke(
+                cli_mod.main,
+                ["alerter", "run", "--escalate-after", "9", "--escalate-occurrences", "4"],
+                env={"DISCORD_WEBHOOK_URL": "https://discord.test/hook"},
+            )
+        assert res.exit_code == 0, res.output
+        assert seen.get("escalate_after_minutes") == 9, seen
+        assert seen.get("escalate_after_occurrences") == 4, seen
+
+    def test_the_cli_defaults_are_not_zero(self):
+        """A default of 0 would ship escalation OFF while the suite stayed green.
+
+        That is the failure this whole PR exists to prevent, arriving through
+        the config rather than the logic.
+        """
+        from click.testing import CliRunner
+
+        from cortex_utils import cli as cli_mod
+
+        seen = {}
+
+        with mock.patch.object(cli_mod, "run_alerter", lambda **kw: seen.update(kw)):
+            res = CliRunner().invoke(
+                cli_mod.main,
+                ["alerter", "run"],
+                env={"DISCORD_WEBHOOK_URL": "https://discord.test/hook"},
+            )
+        assert res.exit_code == 0, res.output
+        assert seen.get("escalate_after_minutes", 0) > 0, seen
+        assert seen.get("escalate_after_occurrences", 0) > 1, seen

@@ -134,11 +134,7 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
         Severity.HIGH,
         10,
         "LLM Error",
-        # NOT "may fall back to rules": on LLM error the triage job RAISES,
-        # retries 3x and dead-letters with NO classification row written, so
-        # the mail ends up unlabelled. 315 jobs died this way in July while
-        # this text told whoever read it that triage had coped. cortex-rao8.
-        "Ollama/LLM request failed. Affected mail is retried 3x and then "
+        "Ollama/LLM request failed. Affected mail is retried, then "
         "dead-lettered UNCLASSIFIED -- it is not rules-classified.",
     ),
     # === WARNING (aggregate for daily summary) ===

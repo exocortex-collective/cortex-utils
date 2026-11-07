@@ -126,6 +126,25 @@ class AlerterDaemon:
 
     def _process_log_line(self, container: str, log_line: str) -> None:
         """Process a single log line and send alerts if needed."""
+
+        def send(title: str, description: str, color: int, log_limit: int, ping: bool) -> None:
+            """The one shape every alert embed has; three copies lived here."""
+            self.discord.send_embed(
+                title=title,
+                description=description,
+                color=color,
+                fields=[
+                    {"name": "Container", "value": container, "inline": True},
+                    {
+                        "name": "Time",
+                        "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "inline": True,
+                    },
+                    {"name": "Log", "value": f"```{log_line[:log_limit]}```", "inline": False},
+                ],
+                ping=ping,
+            )
+
         # Quick filter - only classify lines that look like errors
         if not is_error_line(log_line):
             return
@@ -146,28 +165,18 @@ class AlerterDaemon:
                         container=container,
                         title=classification.title,
                     )
-                    self.discord.send_embed(
-                        title=f"CRITICAL: {classification.title}",
-                        description=classification.description,
-                        color=COLOR_CRITICAL,
-                        fields=[
-                            {"name": "Container", "value": container, "inline": True},
-                            {
-                                "name": "Time",
-                                "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "inline": True,
-                            },
-                            {"name": "Log", "value": f"```{log_line[:500]}```", "inline": False},
-                        ],
-                        ping=self.ping_critical,
+                    send(
+                        f"CRITICAL: {classification.title}",
+                        classification.description,
+                        COLOR_CRITICAL,
+                        500,
+                        self.ping_critical,
                     )
 
             elif classification.severity == Severity.HIGH:
                 # Record EVERY occurrence, including the ones the cooldown is
-                # about to swallow. Those suppressed lines are the only
-                # evidence that an outage is SUSTAINED rather than a blip --
-                # cortex-rao8, where an 8-day Ollama outage was detected every
-                # single time and never once pinged.
+                # about to swallow: those suppressed lines are the only
+                # evidence that an outage is sustained rather than a blip.
                 run = self.rate_limiter.note_occurrence(classification.error_key)
                 now = datetime.now()
                 if self.escalate_after_minutes > 0 and is_sustained(
@@ -182,28 +191,18 @@ class AlerterDaemon:
                         occurrences=run.count,
                         minutes=minutes,
                     )
-                    self.discord.send_embed(
-                        title=f"CRITICAL: {classification.title} (sustained)",
-                        description=(
-                            f"{classification.description}\n\n"
-                            f"Still failing after {minutes} minutes and "
-                            f"{run.count} occurrences; this is not transient."
-                        ),
-                        color=COLOR_CRITICAL,
-                        fields=[
-                            {"name": "Container", "value": container, "inline": True},
-                            {
-                                "name": "Time",
-                                "value": now.strftime("%Y-%m-%d %H:%M:%S"),
-                                "inline": True,
-                            },
-                            {"name": "Log", "value": f"```{log_line[:500]}```", "inline": False},
-                        ],
-                        ping=self.ping_critical,
+                    send(
+                        f"CRITICAL: {classification.title} (sustained)",
+                        f"{classification.description}\n\n"
+                        f"Still failing after {minutes} minutes and "
+                        f"{run.count} occurrences; this is not transient.",
+                        COLOR_CRITICAL,
+                        500,
+                        self.ping_critical,
                     )
-                    # Ping once per outage, not once per line: the next
-                    # occurrence starts a fresh run and must earn it again.
-                    self.rate_limiter.clear_run(classification.error_key)
+                    # Once per outage. The run keeps accumulating and the HIGH
+                    # alerts keep posting, so the outage stays visible.
+                    self.rate_limiter.mark_escalated(classification.error_key)
                 elif self.rate_limiter.should_alert(
                     classification.error_key, classification.cooldown_minutes
                 ):
@@ -212,20 +211,12 @@ class AlerterDaemon:
                         container=container,
                         title=classification.title,
                     )
-                    self.discord.send_embed(
-                        title=f"Warning: {classification.title}",
-                        description=classification.description,
-                        color=COLOR_HIGH,
-                        fields=[
-                            {"name": "Container", "value": container, "inline": True},
-                            {
-                                "name": "Time",
-                                "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "inline": True,
-                            },
-                            {"name": "Log", "value": f"```{log_line[:300]}```", "inline": False},
-                        ],
-                        ping=False,
+                    send(
+                        f"Warning: {classification.title}",
+                        classification.description,
+                        COLOR_HIGH,
+                        300,
+                        False,
                     )
 
             elif classification.severity == Severity.WARNING:
