@@ -1,7 +1,50 @@
 """Rate limiter for alert deduplication."""
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+# A key that keeps firing is a DIFFERENT event from a key that fired once, and
+# the cooldown below cannot tell them apart -- it suppresses repeats, so a
+# multi-day outage looks exactly like a single blip. These bound the
+# "still happening" judgement; see is_sustained.
+DEFAULT_ESCALATE_AFTER_MINUTES = 30
+DEFAULT_ESCALATE_AFTER_OCCURRENCES = 3
+# How long a key must be quiet before the next occurrence starts a NEW run.
+# Without this, a key that fired in July and again in November reads as having
+# been "sustained for four months".
+DEFAULT_RUN_GAP_MINUTES = 60
+
+
+@dataclass(frozen=True)
+class Run:
+    """One unbroken stretch of the same error_key firing."""
+
+    started: datetime
+    last: datetime
+    count: int
+
+
+def is_sustained(
+    run: Run | None,
+    now: datetime,
+    escalate_after_minutes: int,
+    escalate_after_occurrences: int,
+) -> bool:
+    """Has this run been going long enough, and often enough, to escalate?
+
+    A pure function of the state, with no I/O and no clock of its own, because
+    it is a decision over four inputs and those are the ones that get tested
+    case-by-case and miss a cell. Both bounds must be met: duration alone
+    would escalate a single error seen once an hour ago and never again, and
+    count alone would escalate a burst of three lines in one second, which is
+    one event rather than a sustained one.
+    """
+    if run is None:
+        return False
+    if run.count < escalate_after_occurrences:
+        return False
+    return (now - run.started) >= timedelta(minutes=escalate_after_minutes)
 
 
 class RateLimiter:
@@ -19,6 +62,10 @@ class RateLimiter:
         # 2" -- which told a reader nothing about what had failed.
         self.warning_samples: dict[str, str] = {}
         self.last_reset: datetime = datetime.now()
+        # Independent of last_alert, deliberately: last_alert records when we
+        # SPOKE, and the cooldown keeps us quiet, so it cannot answer "is this
+        # still happening". These record what the container actually said.
+        self.runs: dict[str, Run] = {}
 
     def should_alert(self, error_key: str, cooldown_minutes: int) -> bool:
         """Check if we should send an alert for this error.
@@ -43,6 +90,33 @@ class RateLimiter:
             return True
 
         return False
+
+    def note_occurrence(
+        self, error_key: str, now: datetime | None = None, run_gap_minutes: int | None = None
+    ) -> Run:
+        """Record that this error_key just fired, and return its current run.
+
+        Called on EVERY occurrence, including ones the cooldown will then
+        suppress -- that is the whole point, since the suppressed ones are the
+        evidence that an outage is sustained.
+        """
+        now = now or datetime.now()
+        gap = DEFAULT_RUN_GAP_MINUTES if run_gap_minutes is None else run_gap_minutes
+        prev = self.runs.get(error_key)
+        if prev is None or (now - prev.last) > timedelta(minutes=gap):
+            run = Run(started=now, last=now, count=1)
+        else:
+            run = Run(started=prev.started, last=now, count=prev.count + 1)
+        self.runs[error_key] = run
+        return run
+
+    def clear_run(self, error_key: str) -> None:
+        """Forget this key's run, so the next occurrence starts a fresh one.
+
+        Called after escalating, so one sustained outage pings once rather than
+        on every line for as long as it lasts.
+        """
+        self.runs.pop(error_key, None)
 
     def increment_warning(self, error_key: str, sample: str = "") -> None:
         """Increment warning count for daily summary aggregation.

@@ -1100,3 +1100,167 @@ class TestTheTestAlertNamesWhatItWouldWatch:
     def test_an_explicit_list_is_reported_as_given(self):
         d = self._daemon(containers=["cortex-only"])
         assert self._fields(d)["Containers"] == "cortex-only"
+
+
+class TestSustainedErrorsEscalate:
+    """A multi-day outage must not look like a single blip.
+
+    cortex-rao8: Ollama was unreachable for 8 days in two windows, dead-lettering
+    315 triage jobs. The alerter detected EVERY error and posted every one with
+    ping=False, because only CRITICAL pings and the LLM pattern maps to HIGH.
+    The cooldown then suppressed the repeats, so the whole outage was
+    indistinguishable from one transient failure.
+
+    The decision is a pure function of four inputs, so these enumerate the input
+    space rather than sampling it -- a five-dimensional decision tangled with
+    I/O is what shipped the same P1 three times in cortex-school's post_discord.
+    """
+
+    @staticmethod
+    def _run(minutes_ago: int, count: int):
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import Run
+
+        now = datetime.now()
+        return Run(started=now - timedelta(minutes=minutes_ago), last=now, count=count), now
+
+    @pytest.mark.parametrize("minutes_ago", [0, 29, 30, 31, 600])
+    @pytest.mark.parametrize("count", [1, 2, 3, 4, 50])
+    def test_both_bounds_must_be_met(self, minutes_ago, count):
+        """Duration alone and count alone each escalate the wrong thing.
+
+        Duration alone fires on one error seen once an hour ago and never
+        again. Count alone fires on a three-line burst inside one second, which
+        is one event.
+        """
+        from cortex_utils.alerter.rate_limiter import is_sustained
+
+        run, now = self._run(minutes_ago, count)
+        expected = minutes_ago >= 30 and count >= 3
+        assert is_sustained(run, now, 30, 3) is expected
+
+    def test_no_run_is_not_sustained(self):
+        from datetime import datetime
+
+        from cortex_utils.alerter.rate_limiter import is_sustained
+
+        assert is_sustained(None, datetime.now(), 30, 3) is False
+
+    def test_a_quiet_gap_starts_a_new_run(self):
+        """Otherwise a key that fired in July and again in November reads as
+        having been sustained for four months."""
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import RateLimiter
+
+        rl = RateLimiter()
+        t0 = datetime(2026, 7, 1, 12, 0, 0)
+        rl.note_occurrence("k", now=t0, run_gap_minutes=60)
+        far_later = t0 + timedelta(days=120)
+        run = rl.note_occurrence("k", now=far_later, run_gap_minutes=60)
+        assert run.count == 1
+        assert run.started == far_later
+
+    def test_occurrences_inside_the_gap_extend_the_run(self):
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import RateLimiter
+
+        rl = RateLimiter()
+        t0 = datetime(2026, 7, 1, 12, 0, 0)
+        for i in range(4):
+            run = rl.note_occurrence("k", now=t0 + timedelta(minutes=20 * i), run_gap_minutes=60)
+        assert run.count == 4
+        assert run.started == t0
+
+    def test_the_cooldown_does_not_hide_occurrences_from_the_run(self):
+        """The load-bearing one. note_occurrence is called on every line,
+        including the ones should_alert then suppresses -- those suppressed
+        lines ARE the evidence of a sustained outage."""
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import RateLimiter, is_sustained
+
+        rl = RateLimiter()
+        t0 = datetime(2026, 7, 24, 15, 20, 0)
+        # Ten occurrences over five hours; a 10-minute cooldown would suppress
+        # most of them from being POSTED.
+        for i in range(10):
+            run = rl.note_occurrence(
+                "LLM Error", now=t0 + timedelta(minutes=30 * i), run_gap_minutes=60
+            )
+        assert run.count == 10
+        assert is_sustained(run, t0 + timedelta(minutes=270), 30, 3) is True
+
+    def test_clearing_the_run_means_one_ping_per_outage(self):
+        from datetime import datetime, timedelta
+
+        from cortex_utils.alerter.rate_limiter import RateLimiter, is_sustained
+
+        rl = RateLimiter()
+        t0 = datetime(2026, 7, 24, 15, 20, 0)
+        for i in range(5):
+            rl.note_occurrence("k", now=t0 + timedelta(minutes=15 * i), run_gap_minutes=60)
+        rl.clear_run("k")
+        run = rl.note_occurrence("k", now=t0 + timedelta(minutes=80), run_gap_minutes=60)
+        assert run.count == 1
+        assert is_sustained(run, t0 + timedelta(minutes=80), 30, 3) is False
+
+    def test_a_sustained_high_error_pings_and_a_blip_does_not(self):
+        """Drives the real daemon entry point, not the rate limiter.
+
+        The acceptance criterion on cortex-rao8 is about what reaches Discord,
+        so this asserts on send_embed's ping argument rather than on internal
+        state.
+        """
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient") as dc:
+            d = AlerterDaemon(
+                "https://discord.test/hook",
+                containers=["cortex-triage-worker"],
+                escalate_after_minutes=0,  # disabled first, to get the blip baseline
+            )
+            line = "ERROR Ollama error: Server disconnected without sending a response"
+            d._process_log_line("cortex-triage-worker", line)
+            pings = [c.kwargs.get("ping") for c in dc.return_value.send_embed.call_args_list]
+            assert pings, "a HIGH error should still post something"
+            assert all(p is False for p in pings), f"a blip must not ping: {pings}"
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient") as dc:
+            d = AlerterDaemon(
+                "https://discord.test/hook",
+                containers=["cortex-triage-worker"],
+                escalate_after_minutes=30,
+                escalate_after_occurrences=3,
+            )
+            # Backdate a run that has already been going for two hours.
+            from datetime import datetime, timedelta
+
+            from cortex_utils.alerter.rate_limiter import Run
+
+            key = None
+            from cortex_utils.alerter.classifier import classify
+
+            key = classify("cortex-triage-worker", line).error_key
+            now = datetime.now()
+            d.rate_limiter.runs[key] = Run(started=now - timedelta(hours=2), last=now, count=9)
+            d._process_log_line("cortex-triage-worker", line)
+            calls = dc.return_value.send_embed.call_args_list
+            assert calls, "a sustained error must post"
+            assert any(c.kwargs.get("ping") is True for c in calls), (
+                f"a sustained outage must ping: {[c.kwargs.get('ping') for c in calls]}"
+            )
+            titles = [c.kwargs.get("title", "") for c in calls]
+            assert any("CRITICAL" in t and "sustained" in t for t in titles), titles
+
+    def test_the_llm_description_does_not_claim_a_rules_fallback(self):
+        """The secondary bug in cortex-rao8. On LLM error the job raises,
+        retries 3x and dead-letters with no classification row, so the mail is
+        unlabelled -- not rules-classified. The old text said otherwise."""
+        c = classify("cortex-triage-worker", "ERROR Ollama error: No route to host")
+        assert c is not None
+        assert c.severity == Severity.HIGH
+        assert "fall back to rules" not in c.description
+        assert "dead-lettered" in c.description.lower()

@@ -18,7 +18,12 @@ from .discord import (
     COLOR_WARNING,
     DiscordClient,
 )
-from .rate_limiter import RateLimiter
+from .rate_limiter import (
+    DEFAULT_ESCALATE_AFTER_MINUTES,
+    DEFAULT_ESCALATE_AFTER_OCCURRENCES,
+    RateLimiter,
+    is_sustained,
+)
 
 log = get_logger()
 
@@ -54,6 +59,8 @@ class AlerterDaemon:
         containers: list[str] | None = None,
         ping_critical: bool = True,
         summary_hour: int = 6,
+        escalate_after_minutes: int = DEFAULT_ESCALATE_AFTER_MINUTES,
+        escalate_after_occurrences: int = DEFAULT_ESCALATE_AFTER_OCCURRENCES,
     ):
         """Initialize the alerter daemon.
 
@@ -62,6 +69,10 @@ class AlerterDaemon:
             containers: List of container names to monitor (default: cortex-* containers)
             ping_critical: Whether to @here on critical alerts
             summary_hour: Hour (0-23) to send daily summary
+            escalate_after_minutes: A HIGH error still firing after this long is
+                sent as CRITICAL, which pings. 0 disables escalation.
+            escalate_after_occurrences: and only after this many occurrences, so
+                a one-second burst of three lines is not read as an outage.
         """
         self.discord = DiscordClient(webhook_url)
         self.rate_limiter = RateLimiter()
@@ -70,6 +81,8 @@ class AlerterDaemon:
         self._discover = not containers
         self.ping_critical = ping_critical
         self.summary_hour = summary_hour
+        self.escalate_after_minutes = escalate_after_minutes
+        self.escalate_after_occurrences = escalate_after_occurrences
 
         # Thread-safe lock for rate limiter access
         self._lock = threading.Lock()
@@ -150,7 +163,48 @@ class AlerterDaemon:
                     )
 
             elif classification.severity == Severity.HIGH:
-                if self.rate_limiter.should_alert(
+                # Record EVERY occurrence, including the ones the cooldown is
+                # about to swallow. Those suppressed lines are the only
+                # evidence that an outage is SUSTAINED rather than a blip --
+                # cortex-rao8, where an 8-day Ollama outage was detected every
+                # single time and never once pinged.
+                run = self.rate_limiter.note_occurrence(classification.error_key)
+                now = datetime.now()
+                if self.escalate_after_minutes > 0 and is_sustained(
+                    run, now, self.escalate_after_minutes, self.escalate_after_occurrences
+                ):
+                    minutes = int((now - run.started).total_seconds() // 60)
+                    log.warning(
+                        "Sustained error escalated to critical",
+                        container=container,
+                        title=classification.title,
+                        error_key=classification.error_key,
+                        occurrences=run.count,
+                        minutes=minutes,
+                    )
+                    self.discord.send_embed(
+                        title=f"CRITICAL: {classification.title} (sustained)",
+                        description=(
+                            f"{classification.description}\n\n"
+                            f"Still failing after {minutes} minutes and "
+                            f"{run.count} occurrences; this is not transient."
+                        ),
+                        color=COLOR_CRITICAL,
+                        fields=[
+                            {"name": "Container", "value": container, "inline": True},
+                            {
+                                "name": "Time",
+                                "value": now.strftime("%Y-%m-%d %H:%M:%S"),
+                                "inline": True,
+                            },
+                            {"name": "Log", "value": f"```{log_line[:500]}```", "inline": False},
+                        ],
+                        ping=self.ping_critical,
+                    )
+                    # Ping once per outage, not once per line: the next
+                    # occurrence starts a fresh run and must earn it again.
+                    self.rate_limiter.clear_run(classification.error_key)
+                elif self.rate_limiter.should_alert(
                     classification.error_key, classification.cooldown_minutes
                 ):
                     log.info(
@@ -406,6 +460,8 @@ def run_alerter(
     containers: list[str] | None = None,
     ping_critical: bool = True,
     summary_hour: int = 6,
+    escalate_after_minutes: int = DEFAULT_ESCALATE_AFTER_MINUTES,
+    escalate_after_occurrences: int = DEFAULT_ESCALATE_AFTER_OCCURRENCES,
 ) -> None:
     """Run the alerter daemon.
 
@@ -414,6 +470,9 @@ def run_alerter(
         containers: Containers to monitor (default: cortex-* containers)
         ping_critical: Whether to @here on critical alerts
         summary_hour: Hour to send daily summary
+        escalate_after_minutes: Send a still-firing HIGH error as CRITICAL after
+            this long (0 disables)
+        escalate_after_occurrences: and only after this many occurrences
     """
     url = webhook_url or os.environ.get("DISCORD_WEBHOOK_URL")
     if not url:
@@ -426,5 +485,7 @@ def run_alerter(
         containers=containers,
         ping_critical=ping_critical,
         summary_hour=summary_hour,
+        escalate_after_minutes=escalate_after_minutes,
+        escalate_after_occurrences=escalate_after_occurrences,
     )
     daemon.run()
