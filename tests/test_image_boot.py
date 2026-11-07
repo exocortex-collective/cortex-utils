@@ -20,15 +20,20 @@ before `COPY src/`. That ordering is what these tests pin.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
+import pytest
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
-# The venv's bin DIRECTORY, not `python`: a console script baked into that venv
-# needs no resolution at boot either, and pinning an interpreter name would
-# refuse a legitimate /app/.venv/bin/<script>.
-VENV_BIN = "/app/.venv/bin/"
+# The one correct start command. Asserted whole rather than probed for
+# properties: there is exactly one right answer, so equality is both the
+# simplest assertion and the strongest. It rejects a boot-time `pip install`
+# and a `/app/.venv/bin/../../..` path that escapes the venv, without needing
+# to name either of them.
+EXPECTED_START = ["/app/.venv/bin/cortex-utils"]
 
 # The one place the container is actually run. Parameterised by tag so the
 # negative control can run it against a broken image; see the second test.
@@ -54,25 +59,59 @@ def _without_comment(line: str) -> str:
     return line.split("#", 1)[0]
 
 
-def test_the_start_command_is_the_baked_venv():
-    """Asserts the PROPERTY -- the start command IS the baked venv -- rather
-    than forbidding a spelling. Blacklisting "uv run" does not work: `uvx`,
-    `uv  run`, `uv<TAB>run` and a bare `python` all walk past it."""
-    dockerfile = (REPO / "Dockerfile").read_text()
-    cmds = re.findall(
-        r"^\s*(?:CMD|ENTRYPOINT)\s+(.+)$", "\n".join(_joined(dockerfile)), re.M | re.I
-    )
-    assert cmds, "the Dockerfile declares no CMD or ENTRYPOINT"
-    # Joined, so an ENTRYPOINT holding the interpreter and a CMD holding only
-    # its arguments are judged as the one command they combine into.
-    start = " ".join(cmds)
-    assert VENV_BIN in start, (
-        f"the start command must invoke the baked venv by its absolute path, "
-        f"or it is resolving the project at boot: {start}"
-    )
-    # `\buvx?\b`, not the substring "uv": that would refuse `uvicorn`.
-    assert not re.search(r"\buvx?\b", start), (
-        f"the start command goes through uv, so it needs pypi at boot: {start}"
+def _effective_argv(dockerfile: str) -> list[str]:
+    """The argv docker would start the container with, from this file alone.
+
+    Three rules, each measured against `docker inspect` rather than read off
+    the docs:
+
+    1. Only the LAST ENTRYPOINT and the LAST CMD count; an earlier one of
+       either is dead text.
+    2. Only the final build stage ships, so an earlier stage's CMD is not ours.
+    3. An instruction whose argument is a valid JSON array is exec form;
+       ANYTHING ELSE is shell form and becomes /bin/sh -c <the raw text>. That
+       includes an exec-looking array with a trailing comment, because docker
+       treats `#` as a comment only at the start of a line.
+
+    Resolution is then Entrypoint + Cmd, with no special case: for a
+    shell-form ENTRYPOINT docker still keeps the CMD and passes it as $0 of
+    the shell, so it never reaches the command -- but it is in the argv.
+
+    Only what the Dockerfile DECLARES; an inherited CMD or ENTRYPOINT from the
+    base image is not visible here.
+    """
+    joined = re.sub(r"\\\n\s*", " ", dockerfile)
+    joined = joined[joined.rfind("\nFROM ") + 1 :] if "\nFROM " in joined else joined
+
+    def last(kind: str) -> str | None:
+        # re.IGNORECASE: docker instruction keywords are case-insensitive.
+        found = re.findall(rf"^\s*{kind}\s+(.+)$", joined, re.MULTILINE | re.IGNORECASE)
+        return found[-1].strip() if found else None
+
+    def parse(raw: str) -> list[str]:
+        try:
+            argv = json.loads(raw)
+        except json.JSONDecodeError:
+            return ["/bin/sh", "-c", raw]
+        # A JSON value that is not an array is shell form: measured, docker
+        # reads CMD "a", CMD 42 and CMD {"a": 1} all as /bin/sh -c <raw>.
+        return argv if isinstance(argv, list) else ["/bin/sh", "-c", raw]
+
+    return [a for part in (last("ENTRYPOINT"), last("CMD")) if part for a in parse(part)]
+
+
+def test_the_container_starts_with_the_baked_venv():
+    """The whole point: the start command must be the console script already
+    built into the image, so nothing is resolved or fetched at boot.
+
+    The rules above and the cases at the bottom came from cortex-triage #97;
+    re-sync from there if they change.
+    """
+    argv = _effective_argv((REPO / "Dockerfile").read_text())
+    assert argv, "the Dockerfile declares no CMD or ENTRYPOINT"
+    assert argv == EXPECTED_START, (
+        f"the container's start command is not the baked venv, so it resolves "
+        f"the project at boot.\n  expected: {EXPECTED_START}\n  found:    {argv}"
     )
 
 
@@ -101,11 +140,13 @@ def test_the_project_itself_is_installed_after_its_source_is_copied():
     installing = [
         i
         for i, line in enumerate(lines)
-        if re.search(r"^\s*RUN\s+uv\s+sync", line) and "--no-install-project" not in line
+        # Any --no-install-* flag is treated as disabling it, conservatively:
+        # --no-install-package skips only the package it names.
+        if re.search(r"^\s*RUN\s+uv\s+sync", line) and "--no-install-" not in line
     ]
     assert installing, (
         "the Dockerfile never runs a `uv sync` that installs the project "
-        "itself -- every one carries --no-install-project"
+        "itself -- every one carries a --no-install-* flag"
     )
     assert any(i > copy_src for i in installing), (
         "every project-installing `uv sync` runs before `COPY src/`, so the "
@@ -173,3 +214,89 @@ def test_the_negative_control_runs_the_same_probe():
         f"ci.yml runs a container directly rather than through {SMOKE}, so "
         f"that check is outside the negative control: {stray}"
     )
+
+
+# The rules in _effective_argv are exercised by exactly ONE branch of the real
+# Dockerfile (one stage, an exec-form ENTRYPOINT, no CMD), so mutating any of
+# the others away leaves every test above green. These are the regression test
+# for the rules themselves.
+_RIGHT = json.dumps(EXPECTED_START)
+_WRONG = json.dumps(["cortex-utils"])
+_VIA_UV = json.dumps(["uv", "run"] + EXPECTED_START)
+
+START_CASES = [
+    ("the exec-form start command", f"ENTRYPOINT {_RIGHT}", True),
+    (
+        "a stale earlier ENTRYPOINT with a correct final one",
+        f"ENTRYPOINT {_VIA_UV}\nENTRYPOINT {_RIGHT}",
+        True,
+    ),
+    ("a lowercase entrypoint keyword", f"entrypoint {_RIGHT}", True),
+    (
+        "the correct ENTRYPOINT followed by a wrong one",
+        f"ENTRYPOINT {_RIGHT}\nENTRYPOINT {_WRONG}",
+        False,
+    ),
+    ("the command run through uv", f"ENTRYPOINT {_VIA_UV}", False),
+    ("a bare console script from PATH", f"ENTRYPOINT {_WRONG}", False),
+    (
+        "a shell wrapper hiding an install",
+        'ENTRYPOINT ["sh", "-c", "pip install -e . && x"]',
+        False,
+    ),
+    ("the right argv with a trailing comment", f"ENTRYPOINT {_RIGHT} # baked venv", False),
+    ("a lone shell-form ENTRYPOINT", "ENTRYPOINT " + " ".join(EXPECTED_START), False),
+    ("a CMD appended to the correct ENTRYPOINT", f'ENTRYPOINT {_RIGHT}\nCMD ["extra"]', False),
+]
+
+# Rules 1-3 as a docker MODEL, asserted on the resolved argv itself. Each
+# expectation was taken from `docker inspect` on a busybox build.
+RESOLUTION_CASES = [
+    ("only the last CMD counts", 'CMD ["a"]\nCMD ["b"]', ["b"]),
+    (
+        "only the last ENTRYPOINT counts",
+        'ENTRYPOINT ["a"]\nENTRYPOINT ["b"]\nCMD ["c"]',
+        ["b", "c"],
+    ),
+    ("CMD supplies arguments to an exec ENTRYPOINT", 'ENTRYPOINT ["a"]\nCMD ["b"]', ["a", "b"]),
+    (
+        "a shell-form ENTRYPOINT keeps the CMD as $0",
+        'ENTRYPOINT a b\nCMD ["c"]',
+        ["/bin/sh", "-c", "a b", "c"],
+    ),
+    ("a shell-form CMD runs through the shell", "CMD a b", ["/bin/sh", "-c", "a b"]),
+    (
+        "an exec ENTRYPOINT with a shell-form CMD",
+        'ENTRYPOINT ["a"]\nCMD b c',
+        ["a", "/bin/sh", "-c", "b c"],
+    ),
+    ("a trailing comment is not a comment", 'CMD ["a"] # note', ["/bin/sh", "-c", '["a"] # note']),
+    ("only the final build stage counts", 'FROM x\nCMD ["a"]\nFROM y\nCMD ["b"]', ["b"]),
+    ("an earlier stage's CMD does not carry over", 'FROM x\nCMD ["a"]\nFROM y\nRUN true', []),
+    ("trailing whitespace is trimmed", "CMD a b   ", ["/bin/sh", "-c", "a b"]),
+    ("a bare JSON string", 'CMD "a"', ["/bin/sh", "-c", '"a"']),
+    ("a JSON number", "CMD 42", ["/bin/sh", "-c", "42"]),
+    ("a JSON object", 'CMD {"a": 1}', ["/bin/sh", "-c", '{"a": 1}']),
+    # Pins the line-continuation join.
+    (
+        "an ENTRYPOINT split over continuation lines",
+        'ENTRYPOINT [ \\\n    "a", \\\n    "b"]',
+        ["a", "b"],
+    ),
+    ("neither instruction", "RUN true", []),
+]
+
+
+@pytest.mark.parametrize(
+    "body,is_baked", [(b, ok) for _, b, ok in START_CASES], ids=[n for n, _, _ in START_CASES]
+)
+def test_the_start_command_rules(body: str, is_baked: bool):
+    dockerfile = "FROM python:3.13-slim\n" + body + "\n"
+    assert (_effective_argv(dockerfile) == EXPECTED_START) is is_baked
+
+
+@pytest.mark.parametrize(
+    "body,argv", [(b, a) for _, b, a in RESOLUTION_CASES], ids=[n for n, _, _ in RESOLUTION_CASES]
+)
+def test_the_resolution_rules(body: str, argv: list[str]):
+    assert _effective_argv("FROM python:3.13-slim\n" + body + "\n") == argv
