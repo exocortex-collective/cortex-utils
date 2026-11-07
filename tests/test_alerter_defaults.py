@@ -1252,7 +1252,7 @@ class TestSustainedErrorsEscalate:
 
         Forgetting the run instead re-escalates every escalate_after_minutes
         for as long as the outage lasts -- 3 pings in 12 occurrences when
-        measured, hundreds over the 8-day outage this ticket is about.
+        measured.
         """
         from datetime import datetime, timedelta
 
@@ -1540,7 +1540,7 @@ class TestTheEscalationConfigReachesTheDaemon:
         assert seen.get("escalate_after_occurrences") == 4, seen
 
     def test_the_cli_defaults_are_not_zero(self):
-        """A default of 0 would ship escalation OFF while the suite stayed green.
+        """A default of 0 would ship escalation OFF.
 
         That is the failure this whole PR exists to prevent, arriving through
         the config rather than the logic.
