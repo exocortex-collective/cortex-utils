@@ -176,6 +176,14 @@ def load_rules_from_string(yaml_content: str) -> RulesConfig:
     return RulesConfig.model_validate(data)
 
 
+def _unmanaged(names: str | list[str] | None, prefix: str) -> list[str]:
+    """The names a labeling worker with this prefix would not apply."""
+    if not prefix or not names:
+        return []
+    names = [names] if isinstance(names, str) else names
+    return [n for n in names if not n.startswith(f"{prefix}/")]
+
+
 def validate_rules(config: RulesConfig) -> list[str]:
     """Validate rules configuration.
 
@@ -267,6 +275,21 @@ def validate_rules(config: RulesConfig) -> list[str]:
                     f"Chain '{chain_name}' rule {i}: "
                     f"label template references undefined variables: {undefined}"
                 )
+
+            # The labeling worker applies only labels under the prefix, so a
+            # raw add_label outside it would be dropped silently (cortex-gvzf).
+            # An empty prefix means every label is managed. `label` is left
+            # alone (the matcher prefixes it), and so is remove_label, which
+            # the worker never reads.
+            actions = [("action", rule.action)] if rule.action else []
+            actions += [(f"route '{k}'", a) for k, a in (rule.routes or {}).items()]
+            for where, action in actions:
+                for name in _unmanaged(action.add_label, config.label_prefix):
+                    errors.append(
+                        f"Chain '{chain_name}' rule {i}: {where} add_label '{name}' "
+                        f"is outside '{config.label_prefix}/', so the labeling "
+                        "worker would drop it"
+                    )
 
             # Validate route action label templates
             if rule.routes:
