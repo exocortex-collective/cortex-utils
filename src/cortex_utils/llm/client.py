@@ -6,6 +6,7 @@ Supports LiteLLM proxy, Ollama with /v1 endpoints, and any OpenAI-compatible API
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -188,6 +189,12 @@ class LLMClient:
             timeout=120.0,
             headers={"Authorization": f"Bearer {key}"} if key else {},
         )
+        # Sent as reasoning_effort on the chat call when set, e.g. "none" so a
+        # thinking model answers on the first call instead of spending
+        # max_tokens on thinking and falling back to /api/generate. Opt-in:
+        # only set it where the server accepts the parameter, because a 4xx
+        # on the chat call is raised, not retried without it.
+        self.reasoning_effort = os.environ.get("LLM_REASONING_EFFORT", "").strip() or None
 
     @staticmethod
     def _raise_for_status(response: httpx.Response, where: str) -> None:
@@ -260,6 +267,8 @@ class LLMClient:
             payload["temperature"] = temperature
         if response_format:
             payload["response_format"] = response_format
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
 
         response = self.client.post(
             f"{self.base_url}/v1/chat/completions",
