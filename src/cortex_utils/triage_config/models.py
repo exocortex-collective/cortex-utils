@@ -15,7 +15,7 @@ class IntentConfig(BaseModel):
     """
 
     prompt: str
-    model: str = "qwen2.5:0.5b"
+    model: str = "qwen2.5:7b"
 
 
 class EmailCategoryConfig(BaseModel):
@@ -27,7 +27,7 @@ class EmailCategoryConfig(BaseModel):
     """
 
     prompt: str
-    model: str = "qwen2.5:0.5b"
+    model: str = "qwen2.5:7b"
     categories: list[str]
 
     @field_validator("categories")
@@ -136,11 +136,11 @@ class LLMVariable(BaseModel):
     Example:
         llm:
           prompt: "Extract the project name. Return ONLY the name."
-          model: "qwen2.5:0.5b"
+          model: "qwen2.5:7b"
     """
 
     prompt: str  # Prompt template
-    model: str = "qwen2.5:0.5b"
+    model: str = "qwen2.5:7b"
 
 
 class PatternFieldVariable(BaseModel):
@@ -466,7 +466,7 @@ class BodyExtractionPrompt(BaseModel):
     """A prompt template for extracting structured data from email bodies."""
 
     template: str
-    model: str = "qwen2.5:3b"
+    model: str = "qwen2.5:7b"
 
 
 # Built-in classification prompts as raw dicts (single source of truth)
@@ -522,7 +522,7 @@ Receipt line:
 {product_line}
 
 Product name:""",
-        "model": "qwen2.5:3b",
+        "model": "qwen2.5:7b",
     },
 }
 
