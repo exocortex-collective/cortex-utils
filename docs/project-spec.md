@@ -252,7 +252,7 @@ cortex-utils health check
 # cortex-duckdb-api    OK        15ms       8,718 bodies stored
 # cortex-triage-worker OK        -          pid 1235, uptime 3d
 # cortex-labeling      OK        -          pid 1236, uptime 3d
-# ollama               OK        145ms      qwen2.5:0.5b loaded
+# ollama               OK        145ms      qwen2.5:7b loaded
 
 # JSON output for monitoring systems
 cortex-utils health check --format json
