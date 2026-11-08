@@ -10,7 +10,7 @@ import pytest
 from cortex_utils.llm.client import LLMClient
 
 
-def _chat_payload(monkeypatch: pytest.MonkeyPatch, value: str | None) -> dict:
+def _posts(monkeypatch: pytest.MonkeyPatch, value: str | None, content: str = "yes") -> list[dict]:
     if value is None:
         monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
     else:
@@ -19,21 +19,35 @@ def _chat_payload(monkeypatch: pytest.MonkeyPatch, value: str | None) -> dict:
     sent: list[dict] = []
 
     def post(url: str, json: dict | None = None, **kw: object) -> httpx.Response:
-        sent.append(json or {})
-        body = {"choices": [{"message": {"content": "yes"}, "finish_reason": "stop"}]}
+        sent.append({"url": url, **(json or {})})
+        if url.endswith("/api/generate"):
+            body: dict = {"response": "yes", "done_reason": "stop"}
+        else:
+            body = {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
         return httpx.Response(200, json=body, request=httpx.Request("POST", url))
 
     c.client = mock.Mock()
     c.client.post.side_effect = post
     c.check_intent("subject", "Is this {subject}? yes or no", "gemma4:26b")
-    assert len(sent) == 1
-    return sent[0]
+    return sent
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
-def test_unset_or_blank_sends_no_reasoning_effort(monkeypatch, value) -> None:
-    assert "reasoning_effort" not in _chat_payload(monkeypatch, value)
+def test_unset_or_blank_sends_no_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    [chat] = _posts(monkeypatch, value)
+    assert "reasoning_effort" not in chat
 
 
-def test_set_is_sent_on_the_chat_call(monkeypatch) -> None:
-    assert _chat_payload(monkeypatch, "none")["reasoning_effort"] == "none"
+@pytest.mark.parametrize("value", ["none", " none "])
+def test_set_is_sent_stripped_on_the_chat_call(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    [chat] = _posts(monkeypatch, value)
+    assert chat["reasoning_effort"] == "none"
+
+
+def test_the_generate_fallback_does_not_carry_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat, native = _posts(monkeypatch, "none", content="")
+    assert chat["url"].endswith("/v1/chat/completions")
+    assert native["url"].endswith("/api/generate")
+    assert "reasoning_effort" not in native
