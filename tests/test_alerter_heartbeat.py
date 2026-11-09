@@ -127,16 +127,11 @@ class TestStreaming:
         alerter = _daemon()
         alerter.docker_client = mock.Mock()
 
-        def named(n: str) -> mock.Mock:  # Mock(name=...) names the mock
-            m = mock.Mock()
-            m.name = n
-            return m
-
-        def listing(all: bool = False) -> list[mock.Mock]:  # noqa: A002 -- docker-py's name
+        def listing(all: bool = False) -> list[dict]:  # noqa: A002 -- docker-py's name
             names = ["cortex-live", "cortex-dead"] if all else ["cortex-live"]
-            return [named(n) for n in names]
+            return [{"Names": [f"/{n}"]} for n in names]
 
-        alerter.docker_client.containers.list.side_effect = listing
+        alerter.docker_client.api.containers.side_effect = listing
         alerter._stop_event.set()  # run() returns at its final wait()
         with (
             mock.patch.object(alerter, "_connect_docker", return_value=True),
