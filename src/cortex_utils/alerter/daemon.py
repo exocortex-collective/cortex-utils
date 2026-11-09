@@ -174,8 +174,8 @@ class AlerterDaemon:
             # (utils-1756). The names are in the list response already.
             # `Names` also holds a "/consumer/alias" entry per legacy link
             # pointing at the container; the container's own name is the entry
-            # with no inner slash. One malformed entry must not take the rest
-            # of the watch set down with it, which is the whole point here.
+            # with no inner slash. `or ()` is for a missing or null `Names`,
+            # which would otherwise abort the comprehension.
             names = [
                 name
                 for c in self.docker_client.api.containers(all=True)

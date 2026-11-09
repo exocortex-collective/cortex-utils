@@ -342,20 +342,16 @@ class TestDiscoveryIsWiredIn:
         d.docker_client.containers.list.assert_not_called()
 
     def test_a_link_alias_or_a_nameless_entry_is_skipped(self):
-        """Docker lists "/consumer/alias" per legacy link, and the old
-        `c.name` took one name per container. Flattening every entry let
-        "cortex-app/cortex-db" into the watch set, and a missing `Names`
-        raised inside the comprehension -- emptying it.
-        """
         d = self._daemon()
         d.docker_client = mock.Mock()
         d.docker_client.api.containers.return_value = [
-            {"Names": ["/cortex-app/cortex-db", "/cortex-db"]},
+            {"Names": ["/cortex-app/cortex-db", "/cortex-db"]},  # alias first
+            {"Names": ["/cortex-live", "/cortex-app/cortex-live"]},  # alias last
             {"Names": None},
             {},
             {"Names": ["/cortex-gateway"]},
         ]
-        assert d._discover_watch_set() == ["cortex-db", "cortex-gateway"]
+        assert d._discover_watch_set() == ["cortex-db", "cortex-gateway", "cortex-live"]
 
     def test_discovery_returns_cortex_containers_minus_denylist(self):
         d = self._daemon()
