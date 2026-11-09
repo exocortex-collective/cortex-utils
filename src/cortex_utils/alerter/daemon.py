@@ -167,7 +167,16 @@ class AlerterDaemon:
             log.error("Container discovery before Docker connect; watching NOTHING")
             return []
         try:
-            names = [c.name for c in self.docker_client.containers.list(all=True)]
+            # The low-level call is ONE request. containers.list() inspects every
+            # container it lists (1 + N calls), and an inspect of one removed
+            # since the listing raises NotFound -- which sent discovery down the
+            # path below and EMPTIED the watch set, since discovery runs once
+            # (utils-1756). The names are in the list response already.
+            names = [
+                name.lstrip("/")
+                for c in self.docker_client.api.containers(all=True)
+                for name in c["Names"]
+            ]
         except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
             log.error("Cannot list containers; alerter is watching NOTHING", error=str(exc))
             return []

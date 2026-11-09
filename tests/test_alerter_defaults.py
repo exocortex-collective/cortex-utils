@@ -317,10 +317,10 @@ class TestDiscoveryIsWiredIn:
             return AlerterDaemon("https://discord.test/webhook", containers=containers)
 
     @staticmethod
-    def _named(n):  # Mock(name=...) names the mock, it does not set .name
-        m = mock.Mock()
-        m.name = n
-        return m
+    @staticmethod
+    def _listed(*names):
+        """Docker's own list payload: a leading slash, and Names is a list."""
+        return [{"Names": [f"/{n}"]} for n in names]
 
     def test_discovery_before_docker_connect_watches_nothing(self):
         """NOT a stale hardcoded list. An alerter that cannot see Docker says so."""
@@ -331,15 +331,27 @@ class TestDiscoveryIsWiredIn:
     def test_docker_failure_watches_nothing(self):
         d = self._daemon()
         d.docker_client = mock.Mock()
-        d.docker_client.containers.list.side_effect = RuntimeError("socket gone")
+        d.docker_client.api.containers.side_effect = RuntimeError("socket gone")
         assert d._discover_watch_set() == []
+
+    def test_discovery_does_not_inspect_each_container(self):
+        """utils-1756. `containers.list()` inspects every container it lists,
+        and an inspect of one removed since the listing raises NotFound --
+        which took discovery to the branch above and emptied the watch set,
+        because discovery runs once. One list call, no inspect, no window.
+        """
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+        d.docker_client.api.containers.return_value = self._listed("cortex-gateway")
+        assert d._discover_watch_set() == ["cortex-gateway"]
+        d.docker_client.containers.list.assert_not_called()
 
     def test_discovery_returns_cortex_containers_minus_denylist(self):
         d = self._daemon()
         d.docker_client = mock.Mock()
-        d.docker_client.containers.list.return_value = [
-            self._named(n) for n in ["cortex-gateway", "cortex-alerter", "traefik", "cortex-teach"]
-        ]
+        d.docker_client.api.containers.return_value = self._listed(
+            "cortex-gateway", "cortex-alerter", "traefik", "cortex-teach"
+        )
         assert d._discover_watch_set() == ["cortex-gateway", "cortex-teach"]
 
     def test_a_stopped_container_is_still_in_the_watch_set(self):
@@ -353,9 +365,9 @@ class TestDiscoveryIsWiredIn:
 
         def listing(all=False):  # noqa: A002 -- docker-py's own parameter name
             names = ["cortex-gateway", "cortex-teach"] if all else ["cortex-gateway"]
-            return [self._named(n) for n in names]
+            return self._listed(*names)
 
-        d.docker_client.containers.list.side_effect = listing
+        d.docker_client.api.containers.side_effect = listing
         assert d._discover_watch_set() == ["cortex-gateway", "cortex-teach"], (
             "discovery read the RUNNING list, so a container that is down is unwatched"
         )
