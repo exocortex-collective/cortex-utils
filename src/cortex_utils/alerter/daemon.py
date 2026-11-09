@@ -39,6 +39,12 @@ CONTAINER_PREFIX = "cortex-"
 # is excluded rather than implying coverage it cannot provide. cortex-ogqq.
 DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
 
+# Longest a tailer waits for Docker to say its container started before
+# reattaching anyway. The wait returns the moment a start arrives, so this is
+# not how long a restart takes to notice -- it is the ceiling on the case
+# where no start comes at all.
+CONTAINER_START_WAIT_SECONDS = 30
+
 # cortex-ogqq: the alerter cannot report its own death, so it publishes a
 # heartbeat for Prometheus to watch (alerts then reach Discord through
 # alertmanager, not through this process). OPT-IN: with ALERTER_METRICS_PORT
@@ -80,8 +86,8 @@ def metrics_bind(environ: dict[str, str]) -> tuple[str, int] | None:
 def discover_containers(names: list[str]) -> list[str]:
     """Every cortex container except the denylisted ones.
 
-    Takes the live container list rather than a hardcoded one, so a service
-    added tonight is watched tonight.
+    Takes the container list from Docker rather than a hardcoded one, so a
+    service added tonight is watched tonight.
     """
     return sorted(
         n for n in names if n.startswith(CONTAINER_PREFIX) and n not in DENYLISTED_CONTAINERS
@@ -144,8 +150,14 @@ class AlerterDaemon:
             log.error("Failed to connect to Docker", error=str(e))
             return False
 
-    def _discover_running_containers(self) -> list[str]:
-        """Live cortex containers, minus the denylist.
+    def _discover_watch_set(self) -> list[str]:
+        """Every cortex container Docker knows of, running or not, minus the denylist.
+
+        `all=True` is the point (utils-a6ba): with the running list, a
+        container that died before the alerter started was never watched, and
+        `containers_watched` fell in step with `tailers_streaming` so the rule
+        comparing them stayed clean. Docker's own container store is the
+        "expected to run" set; `docker rm` is how a name leaves it.
 
         Falls back to an empty list rather than a stale hardcoded set: an
         alerter that cannot see Docker should say so loudly at startup, not
@@ -155,7 +167,7 @@ class AlerterDaemon:
             log.error("Container discovery before Docker connect; watching NOTHING")
             return []
         try:
-            names = [c.name for c in self.docker_client.containers.list()]
+            names = [c.name for c in self.docker_client.containers.list(all=True)]
         except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
             log.error("Cannot list containers; alerter is watching NOTHING", error=str(exc))
             return []
@@ -283,6 +295,7 @@ class AlerterDaemon:
                 log.info("Starting log tail", container=container_name)
 
                 # Tail logs from now onwards
+                attached_at = time.time()
                 self._streaming[container_name] = True
                 try:
                     for log_entry in container.logs(
@@ -297,6 +310,8 @@ class AlerterDaemon:
                 finally:
                     self._streaming[container_name] = False
 
+                self._await_start(container_name, since=attached_at)
+
             except docker.errors.NotFound:
                 log.warning("Container not found, will retry", container=container_name)
                 time.sleep(60)  # Wait before retrying
@@ -308,6 +323,41 @@ class AlerterDaemon:
             except Exception:
                 log.exception("Unexpected error tailing container", container=container_name)
                 time.sleep(30)
+
+    def _await_start(self, container_name: str, since: float) -> None:
+        """Block until Docker says the container started, or the wait expires.
+
+        A log stream ends the moment its container stops, and reattaching to a
+        stopped container returns EOF in 4ms -- a busy loop on the Docker
+        socket, reachable only since discovery started keeping stopped
+        containers (utils-a6ba).
+
+        Waiting rather than polling, because polling has no good rate. Against
+        a container restarting every ~2s, a tailer caught its startup logs 2
+        of 9 restarts with a backoff doubling 1s -> 30s and 6 of 9 at a flat
+        1s; only a rate fast enough to be the busy loop caught all 9.
+
+        `since` is the moment this tailer attached, so any start after that --
+        including one between the stream ending and this call -- is replayed
+        rather than waited for.
+        """
+        if self.docker_client is None:
+            return
+        deadline = time.time() + CONTAINER_START_WAIT_SECONDS
+        events = self.docker_client.events(
+            filters={"container": container_name, "event": "start"},
+            since=since,
+            until=deadline,
+        )
+        try:
+            for _event in events:
+                return
+        finally:
+            events.close()
+        # The stream can end before the deadline with no event -- measured
+        # returning in 0.2ms -- and reattaching then is the busy loop this
+        # method exists to prevent.
+        time.sleep(max(0.0, deadline - time.time()))
 
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""
@@ -431,7 +481,7 @@ class AlerterDaemon:
         """
         watched = self.containers
         if not watched and self._discover and self._connect_docker():
-            watched = self._discover_running_containers()
+            watched = self._discover_watch_set()
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return self.discord.send_embed(
             title="Test Alert",
@@ -460,7 +510,7 @@ class AlerterDaemon:
         # Discovery needs the connected client, so it happens HERE rather than
         # in __init__. An explicit -c list still wins; this is the default path.
         if self._discover:
-            self.containers = self._discover_running_containers()
+            self.containers = self._discover_watch_set()
         if not self.containers:
             log.error("Alerter is watching NOTHING -- no containers to monitor")
         log.info("Monitoring containers", count=len(self.containers), names=self.containers)

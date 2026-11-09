@@ -118,6 +118,38 @@ class TestStreaming:
         alerter._beat()
         assert seen == [1] and _sample("cortex_alerter_tailers_streaming") == 0
 
+    def test_a_stopped_container_makes_the_two_gauges_diverge(self) -> None:
+        """What utils-a6ba is for. `tailers_streaming < containers_watched`
+        could not fire for a dead container: discovery read the RUNNING list,
+        so both numbers fell together and 10 < 10 stayed clean. Keeping the
+        stopped container in the watch set drops the numerator alone.
+        """
+        alerter = _daemon()
+        alerter.docker_client = mock.Mock()
+
+        def named(n: str) -> mock.Mock:  # Mock(name=...) names the mock
+            m = mock.Mock()
+            m.name = n
+            return m
+
+        def listing(all: bool = False) -> list[mock.Mock]:  # noqa: A002 -- docker-py's name
+            names = ["cortex-live", "cortex-dead"] if all else ["cortex-live"]
+            return [named(n) for n in names]
+
+        alerter.docker_client.containers.list.side_effect = listing
+        alerter._stop_event.set()  # run() returns at its final wait()
+        with (
+            mock.patch.object(alerter, "_connect_docker", return_value=True),
+            mock.patch.object(alerter, "_tail_container"),
+            mock.patch("cortex_utils.alerter.daemon.schedule"),
+        ):
+            alerter.run()
+        alerter._streaming["cortex-live"] = True  # the dead one never gets a stream
+        alerter._beat()
+        watched = _sample("cortex_alerter_containers_watched")
+        streaming = _sample("cortex_alerter_tailers_streaming")
+        assert (watched, streaming) == (2, 1), (watched, streaming)
+
     def test_the_heartbeat_is_not_in_the_default_registry(self) -> None:
         """Importing the alerter must not add series to a host process's /metrics."""
         from prometheus_client import REGISTRY
