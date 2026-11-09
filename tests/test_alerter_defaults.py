@@ -992,10 +992,7 @@ class TestTheTailerDelivers:
 
     @pytest.mark.parametrize(("returned_at", "held"), [(1000.5, 29.5), (1031.0, 0.0)])
     def test_a_wait_that_ends_early_still_holds_off_the_reattach(self, returned_at, held):
-        """An event stream can end with no event in 0.2ms -- measured -- and
-        reattaching then is the busy loop the wait exists to prevent. Pins the
-        30s window as a number, so changing it is deliberate.
-        """
+        """Pins the 30s window as a number, so changing it is deliberate."""
         d = self._daemon()
         d.docker_client = mock.Mock()
         d.docker_client.events.return_value = self._event_stream()
