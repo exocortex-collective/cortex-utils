@@ -39,9 +39,10 @@ CONTAINER_PREFIX = "cortex-"
 # is excluded rather than implying coverage it cannot provide. cortex-ogqq.
 DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
 
-# Longest a tailer waits for Docker to say its container started. It bounds
-# shutdown lag and nothing else: the wait returns the moment the container
-# starts, so a shorter value would not reattach any sooner.
+# Longest a tailer waits for Docker to say its container started before
+# reattaching anyway. The wait returns the moment a start arrives, so this is
+# not how long a restart takes to notice -- it is the ceiling on the case
+# where no start comes at all.
 CONTAINER_START_WAIT_SECONDS = 30
 
 # cortex-ogqq: the alerter cannot report its own death, so it publishes a
@@ -336,22 +337,27 @@ class AlerterDaemon:
         of 9 restarts with a backoff doubling 1s -> 30s and 6 of 9 at a flat
         1s; only a rate fast enough to be the busy loop caught all 9.
 
-        `since` is the moment this tailer attached, so a start between the
-        stream ending and this call is replayed rather than waited for.
+        `since` is the moment this tailer attached, so any start after that --
+        including one between the stream ending and this call -- is replayed
+        rather than waited for.
         """
         if self.docker_client is None:
             return
+        deadline = time.time() + CONTAINER_START_WAIT_SECONDS
         events = self.docker_client.events(
             filters={"container": container_name, "event": "start"},
             since=since,
-            until=time.time() + CONTAINER_START_WAIT_SECONDS,
-            decode=True,
+            until=deadline,
         )
         try:
             for _event in events:
                 return
         finally:
             events.close()
+        # The stream can end before the deadline with no event -- measured
+        # returning in 0.2ms -- and reattaching then is the busy loop this
+        # method exists to prevent.
+        time.sleep(max(0.0, deadline - time.time()))
 
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""

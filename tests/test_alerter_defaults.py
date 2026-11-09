@@ -24,11 +24,7 @@ from cortex_utils.alerter.classifier import (
     is_client_sql_fault,
     is_error_line,
 )
-from cortex_utils.alerter.daemon import (
-    CONTAINER_START_WAIT_SECONDS,
-    DENYLISTED_CONTAINERS,
-    discover_containers,
-)
+from cortex_utils.alerter.daemon import DENYLISTED_CONTAINERS, discover_containers
 
 
 class TestContainerDiscovery:
@@ -867,6 +863,10 @@ class TestTheTailerDelivers:
         container.logs.side_effect = logs
         client = mock.Mock()
         client.containers.get.return_value = container
+        # Without this, events() hands back a Mock, iterating it raises
+        # TypeError, and every tailer test below passes down the error path
+        # instead of the one it is about.
+        client.events.side_effect = lambda **_kw: TestTheTailerDelivers._event_stream()
         client.logs_calls = calls
         return client
 
@@ -920,16 +920,35 @@ class TestTheTailerDelivers:
         )
 
     def test_a_stream_that_ends_waits_for_docker_to_say_it_started(self):
-        """A stopped container is now IN the watch set (utils-a6ba) and its
-        stream returns EOF in 4ms -- measured -- so reattaching at once is a
-        busy loop on the Docker socket.
-        """
         d = self._daemon()
         d.docker_client = self._client(d, [])
         with mock.patch.object(d, "_await_start") as wait:
             d._tail_container("cortex-x")
         assert wait.call_count == 2, "a stream ending must not reattach immediately"
         assert len(d.docker_client.logs_calls) == 2, "and it must reattach afterwards"
+
+    def test_the_wait_happens_with_the_streaming_flag_already_cleared(self):
+        """Or `tailers_streaming` would count a stopped container as streaming
+        for the whole wait, which is the gauge utils-a6ba is about.
+        """
+        d = self._daemon()
+        d.docker_client = self._client(d, [])
+        during = []
+        with mock.patch.object(
+            d, "_await_start", side_effect=lambda *a, **k: during.append(dict(d._streaming))
+        ):
+            d._tail_container("cortex-x")
+        assert during == [{"cortex-x": False}, {"cortex-x": False}]
+
+    def test_a_failure_in_the_start_wait_does_not_end_the_watch(self):
+        d = self._daemon()
+        d.docker_client = self._client(d, [])
+        with (
+            mock.patch.object(d, "_await_start", side_effect=docker.errors.APIError("events gone")),
+            mock.patch("cortex_utils.alerter.daemon.time.sleep"),
+        ):
+            d._tail_container("cortex-x")
+        assert len(d.docker_client.logs_calls) == 2, "the container was left unwatched"
 
     @staticmethod
     def _event_stream(events=()):
@@ -942,7 +961,10 @@ class TestTheTailerDelivers:
         d = self._daemon()
         d.docker_client = mock.Mock()
         d.docker_client.events.return_value = self._event_stream()
-        with mock.patch("cortex_utils.alerter.daemon.time.time", return_value=1000.0):
+        with (
+            mock.patch("cortex_utils.alerter.daemon.time.time", return_value=1000.0),
+            mock.patch("cortex_utils.alerter.daemon.time.sleep"),
+        ):
             d._await_start("cortex-x", since=900.0)
         kw = d.docker_client.events.call_args.kwargs
         assert kw["filters"] == {"container": "cortex-x", "event": "start"}
@@ -950,23 +972,42 @@ class TestTheTailerDelivers:
             "the wait must start where the tailer attached, or a container that "
             "restarted while the stream was ending is waited for instead of replayed"
         )
-        assert kw["until"] == 1000.0 + CONTAINER_START_WAIT_SECONDS, (
-            "an unbounded wait would hold the tailer past shutdown"
-        )
+        assert kw["until"] == 1030.0, "an unbounded wait would never reattach"
 
     def test_the_wait_returns_on_the_first_start_event_and_closes_the_stream(self):
         d = self._daemon()
         d.docker_client = mock.Mock()
-        events = self._event_stream([{"Action": "start"}, {"Action": "start"}])
+        consumed = []
+
+        def counting():
+            for _ in range(3):
+                consumed.append(1)
+                yield {"Action": "start"}
+
+        events = self._event_stream(counting())
         d.docker_client.events.return_value = events
         d._await_start("cortex-x", since=1.0)
+        assert consumed == [1], "the wait must stop at the first start, not drain the stream"
         events.close.assert_called_once()
 
-    def test_the_tailer_attaches_before_it_records_where_to_resume_the_wait(self):
-        """`since` is read before the stream, not after it. Taken afterwards it
-        would be the moment the container was already gone, and a restart in
-        between would be waited for rather than replayed.
+    @pytest.mark.parametrize(("returned_at", "held"), [(1000.5, 29.5), (1031.0, 0.0)])
+    def test_a_wait_that_ends_early_still_holds_off_the_reattach(self, returned_at, held):
+        """An event stream can end with no event in 0.2ms -- measured -- and
+        reattaching then is the busy loop the wait exists to prevent. Pins the
+        30s window as a number, so changing it is deliberate.
         """
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+        d.docker_client.events.return_value = self._event_stream()
+        clock = iter([1000.0, returned_at])
+        with (
+            mock.patch("cortex_utils.alerter.daemon.time.time", lambda: next(clock)),
+            mock.patch("cortex_utils.alerter.daemon.time.sleep") as sleep,
+        ):
+            d._await_start("cortex-x", since=1.0)
+        assert sleep.call_args_list == [mock.call(held)]
+
+    def test_the_tailer_records_where_to_resume_before_it_attaches(self):
         d = self._daemon()
         d.docker_client = self._client(d, [])
         clock = iter([100.0, 200.0, 300.0, 400.0])
