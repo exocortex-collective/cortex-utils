@@ -317,7 +317,6 @@ class TestDiscoveryIsWiredIn:
             return AlerterDaemon("https://discord.test/webhook", containers=containers)
 
     @staticmethod
-    @staticmethod
     def _listed(*names):
         """Docker's own list payload: a leading slash, and Names is a list."""
         return [{"Names": [f"/{n}"]} for n in names]
@@ -335,16 +334,28 @@ class TestDiscoveryIsWiredIn:
         assert d._discover_watch_set() == []
 
     def test_discovery_does_not_inspect_each_container(self):
-        """utils-1756. `containers.list()` inspects every container it lists,
-        and an inspect of one removed since the listing raises NotFound --
-        which took discovery to the branch above and emptied the watch set,
-        because discovery runs once. One list call, no inspect, no window.
-        """
+        """utils-1756. An inspect raising NotFound emptied the watch set."""
         d = self._daemon()
         d.docker_client = mock.Mock()
         d.docker_client.api.containers.return_value = self._listed("cortex-gateway")
         assert d._discover_watch_set() == ["cortex-gateway"]
         d.docker_client.containers.list.assert_not_called()
+
+    def test_a_link_alias_or_a_nameless_entry_is_skipped(self):
+        """Docker lists "/consumer/alias" per legacy link, and the old
+        `c.name` took one name per container. Flattening every entry let
+        "cortex-app/cortex-db" into the watch set, and a missing `Names`
+        raised inside the comprehension -- emptying it.
+        """
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+        d.docker_client.api.containers.return_value = [
+            {"Names": ["/cortex-app/cortex-db", "/cortex-db"]},
+            {"Names": None},
+            {},
+            {"Names": ["/cortex-gateway"]},
+        ]
+        assert d._discover_watch_set() == ["cortex-db", "cortex-gateway"]
 
     def test_discovery_returns_cortex_containers_minus_denylist(self):
         d = self._daemon()

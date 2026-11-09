@@ -172,10 +172,15 @@ class AlerterDaemon:
             # since the listing raises NotFound -- which sent discovery down the
             # path below and EMPTIED the watch set, since discovery runs once
             # (utils-1756). The names are in the list response already.
+            # `Names` also holds a "/consumer/alias" entry per legacy link
+            # pointing at the container; the container's own name is the entry
+            # with no inner slash. One malformed entry must not take the rest
+            # of the watch set down with it, which is the whole point here.
             names = [
-                name.lstrip("/")
+                name
                 for c in self.docker_client.api.containers(all=True)
-                for name in c["Names"]
+                for name in (n.lstrip("/") for n in c.get("Names") or ())
+                if "/" not in name
             ]
         except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
             log.error("Cannot list containers; alerter is watching NOTHING", error=str(exc))
