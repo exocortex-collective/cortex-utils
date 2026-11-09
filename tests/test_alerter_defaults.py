@@ -24,7 +24,11 @@ from cortex_utils.alerter.classifier import (
     is_client_sql_fault,
     is_error_line,
 )
-from cortex_utils.alerter.daemon import DENYLISTED_CONTAINERS, discover_containers
+from cortex_utils.alerter.daemon import (
+    DENYLISTED_CONTAINERS,
+    STOPPED_CONTAINER_POLL_SECONDS,
+    discover_containers,
+)
 
 
 class TestContainerDiscovery:
@@ -316,31 +320,49 @@ class TestDiscoveryIsWiredIn:
         with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
             return AlerterDaemon("https://discord.test/webhook", containers=containers)
 
+    @staticmethod
+    def _named(n):  # Mock(name=...) names the mock, it does not set .name
+        m = mock.Mock()
+        m.name = n
+        return m
+
     def test_discovery_before_docker_connect_watches_nothing(self):
         """NOT a stale hardcoded list. An alerter that cannot see Docker says so."""
         d = self._daemon()
         d.docker_client = None
-        assert d._discover_running_containers() == []
+        assert d._discover_watch_set() == []
 
     def test_docker_failure_watches_nothing(self):
         d = self._daemon()
         d.docker_client = mock.Mock()
         d.docker_client.containers.list.side_effect = RuntimeError("socket gone")
-        assert d._discover_running_containers() == []
+        assert d._discover_watch_set() == []
 
-    def test_discovery_returns_live_cortex_containers_minus_denylist(self):
+    def test_discovery_returns_cortex_containers_minus_denylist(self):
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+        d.docker_client.containers.list.return_value = [
+            self._named(n) for n in ["cortex-gateway", "cortex-alerter", "traefik", "cortex-teach"]
+        ]
+        assert d._discover_watch_set() == ["cortex-gateway", "cortex-teach"]
+
+    def test_a_stopped_container_is_still_in_the_watch_set(self):
+        """utils-a6ba. cortex-teach died six seconds before discovery ran on
+        2026-11-09 and so was never watched at all; `containers_watched` fell
+        11 -> 10 in step with `tailers_streaming`, which is why the rule
+        comparing them stayed clean through a dead container.
+        """
         d = self._daemon()
         d.docker_client = mock.Mock()
 
-        def named(n):  # Mock(name=...) names the mock, it does not set .name
-            m = mock.Mock()
-            m.name = n
-            return m
+        def listing(all=False):  # noqa: A002 -- docker-py's own parameter name
+            names = ["cortex-gateway", "cortex-teach"] if all else ["cortex-gateway"]
+            return [self._named(n) for n in names]
 
-        d.docker_client.containers.list.return_value = [
-            named(n) for n in ["cortex-gateway", "cortex-alerter", "traefik", "cortex-teach"]
-        ]
-        assert d._discover_running_containers() == ["cortex-gateway", "cortex-teach"]
+        d.docker_client.containers.list.side_effect = listing
+        assert d._discover_watch_set() == ["cortex-gateway", "cortex-teach"], (
+            "discovery read the RUNNING list, so a container that is down is unwatched"
+        )
 
     def _run_once(self, daemon, discovered):
         """Drive run() to completion without booting the daemon."""
@@ -348,7 +370,7 @@ class TestDiscoveryIsWiredIn:
         with (
             mock.patch.object(daemon, "_connect_docker", return_value=True),
             mock.patch.object(daemon, "_tail_container"),
-            mock.patch.object(daemon, "_discover_running_containers", return_value=discovered),
+            mock.patch.object(daemon, "_discover_watch_set", return_value=discovered),
             mock.patch("cortex_utils.alerter.daemon.schedule"),
         ):
             daemon.run()
@@ -741,7 +763,7 @@ class TestTheSummaryIsActuallyScheduled:
         with (
             mock.patch.object(daemon, "_connect_docker", return_value=True),
             mock.patch.object(daemon, "_tail_container"),
-            mock.patch.object(daemon, "_discover_running_containers", return_value=["cortex-x"]),
+            mock.patch.object(daemon, "_discover_watch_set", return_value=["cortex-x"]),
             mock.patch("cortex_utils.alerter.daemon.schedule") as sched,
         ):
             daemon.run()
@@ -824,7 +846,7 @@ class TestTheTailerDelivers:
         return d
 
     @staticmethod
-    def _client(d, lines, raise_first=None):
+    def _client(d, lines, raise_first=None, status="running"):
         """A docker client whose SECOND tail attempt stops the loop.
 
         Stopping from inside logs() means the loop terminates whatever the mutant
@@ -832,6 +854,7 @@ class TestTheTailerDelivers:
         """
         calls = []
         container = mock.Mock()
+        container.status = status
 
         def logs(**kw):
             calls.append(kw)
@@ -897,6 +920,27 @@ class TestTheTailerDelivers:
             f"{type(exc).__name__} left the container permanently unwatched"
         )
 
+    def test_a_stopped_container_is_re_probed_on_a_backoff_not_in_a_busy_loop(self):
+        """A stopped container is now IN the watch set (utils-a6ba), and a follow
+        stream over one returns EOF in 4ms -- measured. Reconnecting straight
+        away is a ~350-per-second hammer on the Docker socket.
+        """
+        d = self._daemon()
+        d.docker_client = self._client(d, [], status="exited")
+        with mock.patch("cortex_utils.alerter.daemon.time.sleep") as sleep:
+            d._tail_container("cortex-x")
+        assert sleep.call_args_list[:1] == [mock.call(STOPPED_CONTAINER_POLL_SECONDS)]
+
+    def test_a_restarted_container_is_reconnected_at_once(self):
+        """Its stream ended because it was restarted, so it is running again and
+        emitting the startup logs that say why. A backoff here would drop them.
+        """
+        d = self._daemon()
+        d.docker_client = self._client(d, [], status="running")
+        with mock.patch("cortex_utils.alerter.daemon.time.sleep") as sleep:
+            d._tail_container("cortex-x")
+        assert not sleep.called, "a running container must be re-followed immediately"
+
     def test_the_reconnect_resumes_from_now_and_so_drops_the_gap(self):
         """Pins a KNOWN LOSS so that changing it is deliberate.
 
@@ -954,7 +998,7 @@ class TestRunStartsATailerPerContainer:
         with (
             mock.patch.object(d, "_connect_docker", return_value=True),
             mock.patch.object(d, "_tail_container") as tail,
-            mock.patch.object(d, "_discover_running_containers", return_value=discovered or []),
+            mock.patch.object(d, "_discover_watch_set", return_value=discovered or []),
             mock.patch("cortex_utils.alerter.daemon.schedule"),
         ):
             d.run()
@@ -1083,9 +1127,7 @@ class TestTheTestAlertNamesWhatItWouldWatch:
         d = self._daemon()
         with (
             mock.patch.object(d, "_connect_docker", return_value=True),
-            mock.patch.object(
-                d, "_discover_running_containers", return_value=["cortex-a", "cortex-b"]
-            ),
+            mock.patch.object(d, "_discover_watch_set", return_value=["cortex-a", "cortex-b"]),
         ):
             assert self._fields(d)["Containers"] == "cortex-a, cortex-b"
 

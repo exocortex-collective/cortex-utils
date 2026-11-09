@@ -39,6 +39,11 @@ CONTAINER_PREFIX = "cortex-"
 # is excluded rather than implying coverage it cannot provide. cortex-ogqq.
 DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
 
+# How long a tailer waits before re-probing a container that is not running.
+# It only has to be long enough to stop the reconnect being a busy loop; the
+# rule that notices is CortexAlerterNotStreaming, which has for: 15m.
+STOPPED_CONTAINER_POLL_SECONDS = 30
+
 # cortex-ogqq: the alerter cannot report its own death, so it publishes a
 # heartbeat for Prometheus to watch (alerts then reach Discord through
 # alertmanager, not through this process). OPT-IN: with ALERTER_METRICS_PORT
@@ -80,8 +85,8 @@ def metrics_bind(environ: dict[str, str]) -> tuple[str, int] | None:
 def discover_containers(names: list[str]) -> list[str]:
     """Every cortex container except the denylisted ones.
 
-    Takes the live container list rather than a hardcoded one, so a service
-    added tonight is watched tonight.
+    Takes the container list from Docker rather than a hardcoded one, so a
+    service added tonight is watched tonight.
     """
     return sorted(
         n for n in names if n.startswith(CONTAINER_PREFIX) and n not in DENYLISTED_CONTAINERS
@@ -144,8 +149,16 @@ class AlerterDaemon:
             log.error("Failed to connect to Docker", error=str(e))
             return False
 
-    def _discover_running_containers(self) -> list[str]:
-        """Live cortex containers, minus the denylist.
+    def _discover_watch_set(self) -> list[str]:
+        """Every cortex container Docker knows of, running or not, minus the denylist.
+
+        `all=True` is the whole point (utils-a6ba): with the running list, a
+        container that died before the alerter started was never watched, and
+        `containers_watched` fell in step with `tailers_streaming` so the rule
+        comparing them stayed clean. A stopped container keeps its name in the
+        set and holds no stream, which is what makes that rule fire. Docker's
+        own container store is the "expected to run" set, and `docker rm` is
+        how someone says otherwise.
 
         Falls back to an empty list rather than a stale hardcoded set: an
         alerter that cannot see Docker should say so loudly at startup, not
@@ -155,7 +168,7 @@ class AlerterDaemon:
             log.error("Container discovery before Docker connect; watching NOTHING")
             return []
         try:
-            names = [c.name for c in self.docker_client.containers.list()]
+            names = [c.name for c in self.docker_client.containers.list(all=True)]
         except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
             log.error("Cannot list containers; alerter is watching NOTHING", error=str(exc))
             return []
@@ -297,6 +310,15 @@ class AlerterDaemon:
                 finally:
                     self._streaming[container_name] = False
 
+                # A follow stream over a container that is not running returns
+                # EOF immediately -- measured at 4ms, so reconnecting at once
+                # hammers the socket ~350 times a second. Back off for those.
+                # A RUNNING container whose stream ended was restarted, so
+                # reconnect now rather than miss its startup logs.
+                container.reload()
+                if container.status != "running":
+                    time.sleep(STOPPED_CONTAINER_POLL_SECONDS)
+
             except docker.errors.NotFound:
                 log.warning("Container not found, will retry", container=container_name)
                 time.sleep(60)  # Wait before retrying
@@ -431,7 +453,7 @@ class AlerterDaemon:
         """
         watched = self.containers
         if not watched and self._discover and self._connect_docker():
-            watched = self._discover_running_containers()
+            watched = self._discover_watch_set()
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return self.discord.send_embed(
             title="Test Alert",
@@ -460,7 +482,7 @@ class AlerterDaemon:
         # Discovery needs the connected client, so it happens HERE rather than
         # in __init__. An explicit -c list still wins; this is the default path.
         if self._discover:
-            self.containers = self._discover_running_containers()
+            self.containers = self._discover_watch_set()
         if not self.containers:
             log.error("Alerter is watching NOTHING -- no containers to monitor")
         log.info("Monitoring containers", count=len(self.containers), names=self.containers)
