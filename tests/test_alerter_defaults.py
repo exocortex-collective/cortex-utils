@@ -25,8 +25,8 @@ from cortex_utils.alerter.classifier import (
     is_error_line,
 )
 from cortex_utils.alerter.daemon import (
+    CONTAINER_START_WAIT_SECONDS,
     DENYLISTED_CONTAINERS,
-    STOPPED_CONTAINER_POLL_SECONDS,
     discover_containers,
 )
 
@@ -846,7 +846,7 @@ class TestTheTailerDelivers:
         return d
 
     @staticmethod
-    def _client(d, lines, raise_first=None, status="running"):
+    def _client(d, lines, raise_first=None):
         """A docker client whose SECOND tail attempt stops the loop.
 
         Stopping from inside logs() means the loop terminates whatever the mutant
@@ -854,7 +854,6 @@ class TestTheTailerDelivers:
         """
         calls = []
         container = mock.Mock()
-        container.status = status
 
         def logs(**kw):
             calls.append(kw)
@@ -920,26 +919,63 @@ class TestTheTailerDelivers:
             f"{type(exc).__name__} left the container permanently unwatched"
         )
 
-    def test_a_stopped_container_is_re_probed_on_a_backoff_not_in_a_busy_loop(self):
-        """A stopped container is now IN the watch set (utils-a6ba), and a follow
-        stream over one returns EOF in 4ms -- measured. Reconnecting straight
-        away is a ~350-per-second hammer on the Docker socket.
+    def test_a_stream_that_ends_waits_for_docker_to_say_it_started(self):
+        """A stopped container is now IN the watch set (utils-a6ba) and its
+        stream returns EOF in 4ms -- measured -- so reattaching at once is a
+        busy loop on the Docker socket.
         """
         d = self._daemon()
-        d.docker_client = self._client(d, [], status="exited")
-        with mock.patch("cortex_utils.alerter.daemon.time.sleep") as sleep:
+        d.docker_client = self._client(d, [])
+        with mock.patch.object(d, "_await_start") as wait:
             d._tail_container("cortex-x")
-        assert sleep.call_args_list[:1] == [mock.call(STOPPED_CONTAINER_POLL_SECONDS)]
+        assert wait.call_count == 2, "a stream ending must not reattach immediately"
+        assert len(d.docker_client.logs_calls) == 2, "and it must reattach afterwards"
 
-    def test_a_restarted_container_is_reconnected_at_once(self):
-        """Its stream ended because it was restarted, so it is running again and
-        emitting the startup logs that say why. A backoff here would drop them.
+    @staticmethod
+    def _event_stream(events=()):
+        """docker-py returns a CancellableStream: iterable, and closeable."""
+        stream = mock.MagicMock()
+        stream.__iter__ = lambda _self: iter(events)
+        return stream
+
+    def test_the_wait_asks_docker_only_about_this_container_starting(self):
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+        d.docker_client.events.return_value = self._event_stream()
+        with mock.patch("cortex_utils.alerter.daemon.time.time", return_value=1000.0):
+            d._await_start("cortex-x", since=900.0)
+        kw = d.docker_client.events.call_args.kwargs
+        assert kw["filters"] == {"container": "cortex-x", "event": "start"}
+        assert kw["since"] == 900.0, (
+            "the wait must start where the tailer attached, or a container that "
+            "restarted while the stream was ending is waited for instead of replayed"
+        )
+        assert kw["until"] == 1000.0 + CONTAINER_START_WAIT_SECONDS, (
+            "an unbounded wait would hold the tailer past shutdown"
+        )
+
+    def test_the_wait_returns_on_the_first_start_event_and_closes_the_stream(self):
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+        events = self._event_stream([{"Action": "start"}, {"Action": "start"}])
+        d.docker_client.events.return_value = events
+        d._await_start("cortex-x", since=1.0)
+        events.close.assert_called_once()
+
+    def test_the_tailer_attaches_before_it_records_where_to_resume_the_wait(self):
+        """`since` is read before the stream, not after it. Taken afterwards it
+        would be the moment the container was already gone, and a restart in
+        between would be waited for rather than replayed.
         """
         d = self._daemon()
-        d.docker_client = self._client(d, [], status="running")
-        with mock.patch("cortex_utils.alerter.daemon.time.sleep") as sleep:
+        d.docker_client = self._client(d, [])
+        clock = iter([100.0, 200.0, 300.0, 400.0])
+        with (
+            mock.patch.object(d, "_await_start") as wait,
+            mock.patch("cortex_utils.alerter.daemon.time.time", lambda: next(clock)),
+        ):
             d._tail_container("cortex-x")
-        assert not sleep.called, "a running container must be re-followed immediately"
+        assert wait.call_args_list[0].kwargs["since"] == 100.0
 
     def test_the_reconnect_resumes_from_now_and_so_drops_the_gap(self):
         """Pins a KNOWN LOSS so that changing it is deliberate.

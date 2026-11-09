@@ -39,10 +39,10 @@ CONTAINER_PREFIX = "cortex-"
 # is excluded rather than implying coverage it cannot provide. cortex-ogqq.
 DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
 
-# How long a tailer waits before re-probing a container that is not running.
-# It only has to be long enough to stop the reconnect being a busy loop; the
-# rule that notices is CortexAlerterNotStreaming, which has for: 15m.
-STOPPED_CONTAINER_POLL_SECONDS = 30
+# Longest a tailer waits for Docker to say its container started. It bounds
+# shutdown lag and nothing else: the wait returns the moment the container
+# starts, so a shorter value would not reattach any sooner.
+CONTAINER_START_WAIT_SECONDS = 30
 
 # cortex-ogqq: the alerter cannot report its own death, so it publishes a
 # heartbeat for Prometheus to watch (alerts then reach Discord through
@@ -152,13 +152,11 @@ class AlerterDaemon:
     def _discover_watch_set(self) -> list[str]:
         """Every cortex container Docker knows of, running or not, minus the denylist.
 
-        `all=True` is the whole point (utils-a6ba): with the running list, a
+        `all=True` is the point (utils-a6ba): with the running list, a
         container that died before the alerter started was never watched, and
         `containers_watched` fell in step with `tailers_streaming` so the rule
-        comparing them stayed clean. A stopped container keeps its name in the
-        set and holds no stream, which is what makes that rule fire. Docker's
-        own container store is the "expected to run" set, and `docker rm` is
-        how someone says otherwise.
+        comparing them stayed clean. Docker's own container store is the
+        "expected to run" set; `docker rm` is how a name leaves it.
 
         Falls back to an empty list rather than a stale hardcoded set: an
         alerter that cannot see Docker should say so loudly at startup, not
@@ -296,6 +294,7 @@ class AlerterDaemon:
                 log.info("Starting log tail", container=container_name)
 
                 # Tail logs from now onwards
+                attached_at = time.time()
                 self._streaming[container_name] = True
                 try:
                     for log_entry in container.logs(
@@ -310,14 +309,7 @@ class AlerterDaemon:
                 finally:
                     self._streaming[container_name] = False
 
-                # A follow stream over a container that is not running returns
-                # EOF immediately -- measured at 4ms, so reconnecting at once
-                # hammers the socket ~350 times a second. Back off for those.
-                # A RUNNING container whose stream ended was restarted, so
-                # reconnect now rather than miss its startup logs.
-                container.reload()
-                if container.status != "running":
-                    time.sleep(STOPPED_CONTAINER_POLL_SECONDS)
+                self._await_start(container_name, since=attached_at)
 
             except docker.errors.NotFound:
                 log.warning("Container not found, will retry", container=container_name)
@@ -330,6 +322,36 @@ class AlerterDaemon:
             except Exception:
                 log.exception("Unexpected error tailing container", container=container_name)
                 time.sleep(30)
+
+    def _await_start(self, container_name: str, since: float) -> None:
+        """Block until Docker says the container started, or the wait expires.
+
+        A log stream ends the moment its container stops, and reattaching to a
+        stopped container returns EOF in 4ms -- a busy loop on the Docker
+        socket, reachable only since discovery started keeping stopped
+        containers (utils-a6ba).
+
+        Waiting rather than polling, because polling has no good rate. Against
+        a container restarting every ~2s, a tailer caught its startup logs 2
+        of 9 restarts with a backoff doubling 1s -> 30s and 6 of 9 at a flat
+        1s; only a rate fast enough to be the busy loop caught all 9.
+
+        `since` is the moment this tailer attached, so a start between the
+        stream ending and this call is replayed rather than waited for.
+        """
+        if self.docker_client is None:
+            return
+        events = self.docker_client.events(
+            filters={"container": container_name, "event": "start"},
+            since=since,
+            until=time.time() + CONTAINER_START_WAIT_SECONDS,
+            decode=True,
+        )
+        try:
+            for _event in events:
+                return
+        finally:
+            events.close()
 
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""
