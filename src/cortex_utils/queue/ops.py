@@ -359,10 +359,10 @@ def has_recoveries_column(conn: psycopg2.extensions.connection) -> bool:
 def ensure_recoveries_column(conn: psycopg2.extensions.connection) -> bool:
     """Add recoveries if this schema predates recovery counting. True if added.
 
-    Same shape as ensure_claim_token_column, for the same reason: services call
-    this on every boot, the ALTER takes ACCESS EXCLUSIVE on a partitioned
-    parent under live claim traffic, and running it unconditionally would queue
-    that lock behind real work on every redeploy.
+    Same shape as ensure_claim_token_column, for the same reason: the ALTER
+    takes ACCESS EXCLUSIVE on a partitioned parent under live claim traffic,
+    and running it unconditionally would queue that lock behind real work on
+    every redeploy.
 
     NOT NULL DEFAULT 0 rather than nullable, so every pre-existing row starts
     at 0 and needs no backfill. Postgres 11+ stores a constant default in the

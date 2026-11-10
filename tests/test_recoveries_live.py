@@ -369,8 +369,9 @@ def test_a_table_predating_the_column_is_migrated_not_refused(conn) -> None:
         assert cur.fetchone()[0] is True, "added NOT NULL so claim() can increment"
 
     # And the added column is usable immediately, with no backfill step: the
-    # increment reads COALESCE(recoveries, 0), but the DEFAULT is what makes
-    # pre-existing rows start at 0 rather than NULL.
+    # increment reads COALESCE(recoveries, 0), but the DEFAULT is what makes a
+    # row enqueued after the migration start at 0 rather than NULL. Rows that
+    # predate the column are the other half, below.
     job_id = enqueue(conn, "q", {"x": 1})
     conn.commit()
     claim(conn, "q", "worker-a", visibility_timeout_min=VIS)
@@ -378,13 +379,38 @@ def test_a_table_predating_the_column_is_migrated_not_refused(conn) -> None:
     assert _row(conn, job_id)[0] == 1
 
 
+def test_a_populated_table_predating_the_column_starts_its_rows_at_zero(
+    conn,
+) -> None:
+    """The deployment shape, which an empty table cannot reach.
+
+    ADD COLUMN ... NOT NULL without a DEFAULT fails outright on a POPULATED
+    table, so the migration test above -- whose queue is empty when the column
+    is dropped -- exercises a different path from the one a real redeploy takes.
+    Every production queue table predating this column has rows in it.
+    """
+    job_id = enqueue(conn, "q", {"x": 1})
+    conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE queue DROP COLUMN recoveries")
+    conn.commit()
+    assert has_recoveries_column(conn) is False, "precondition"
+
+    ensure_queue_schema(conn)
+
+    assert has_recoveries_column(conn) is True
+    assert _row(conn, job_id)[0] == 0, "the row predating the column reads 0"
+
+
 def test_the_column_migration_declines_once_the_column_is_there(conn) -> None:
-    """Services call ensure_recoveries_column() on every boot, so the pre-check
-    is what keeps the ALTER's ACCESS EXCLUSIVE lock off the steady-state path.
+    """The pre-check is what keeps the ALTER's ACCESS EXCLUSIVE lock off the
+    steady-state path.
     """
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE queue DROP COLUMN recoveries")
     conn.commit()
+    assert has_recoveries_column(conn) is False, "precondition"
 
     assert ensure_recoveries_column(conn) is True, "it reports having added it"
     assert ensure_recoveries_column(conn) is False, "and declines the second time"
