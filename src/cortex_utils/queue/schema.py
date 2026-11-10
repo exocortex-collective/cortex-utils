@@ -30,8 +30,10 @@ from cortex_utils.log import get_logger
 from cortex_utils.queue.add_retry_columns import add_retry_columns
 from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.ops import (
+    DEFAULT_MAX_ATTEMPTS,
     QueueError,
     _tx,
+    ensure_attempt_columns_not_null,
     ensure_claim_token_column,
     index_present,
 )
@@ -50,7 +52,7 @@ REQUIRED_COLUMNS: dict[str, str] = {
     "status": "TEXT NOT NULL DEFAULT 'pending'",
     "priority": "INT NOT NULL DEFAULT 0",
     "attempts": "INT NOT NULL DEFAULT 0",
-    "max_attempts": "INT NOT NULL DEFAULT 3",
+    "max_attempts": f"INT NOT NULL DEFAULT {DEFAULT_MAX_ATTEMPTS}",
     "last_error": "TEXT",
     "claimed_at": "TIMESTAMPTZ",
     # The claim token. Without it every caller is anonymous and a worker that
@@ -408,6 +410,9 @@ def _ensure_queue_schema_locked(
         # one. A fresh database gets every column from queue_ddl() instead.
         add_retry_columns(conn, dry_run=False)
         ensure_claim_token_column(conn)
+        # The only one of the three that may decline -- it tightens a
+        # constraint rather than adding a column a query names.
+        ensure_attempt_columns_not_null(conn)
 
     result = ensure_queue_table(conn, extra_indexes=extra_indexes)
 

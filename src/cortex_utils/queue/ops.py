@@ -73,6 +73,13 @@ log = get_logger()
 DEFAULT_VISIBILITY_TIMEOUT_MIN = 30
 ERROR_MAX_CHARS = 2000
 
+# The DDL's DEFAULT, kept here and not in schema.py because schema.py imports
+# ops and not the reverse.
+DEFAULT_MAX_ATTEMPTS = 3
+
+# The columns ensure_attempt_columns_not_null() tightens.
+_ATTEMPT_COLUMNS = ("attempts", "max_attempts")
+
 # ALTER TABLE on a partitioned parent takes ACCESS EXCLUSIVE and cascades to
 # every partition. Bounded so a boot cannot wedge the pipeline behind a claim.
 MIGRATION_LOCK_TIMEOUT_MS = 5000
@@ -325,6 +332,118 @@ def ensure_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
         cur.execute("ALTER TABLE queue ADD COLUMN IF NOT EXISTS claimed_by TEXT")
     log.info("Added queue.claimed_by")
     return True
+
+
+def nullable_attempt_columns(conn: psycopg2.extensions.connection) -> list[str]:
+    """Which of attempts/max_attempts this schema's queue still allows NULL in.
+
+    to_regclass('queue'), not a hardcoded schema, for the reason
+    has_next_attempt_at_column records: two schemas share this database and the
+    parent is resolved through search_path, so naming public answered a cryo
+    connection about cortex's table.
+    """
+    require_queue_table(conn)
+    with _tx(conn) as cur:
+        cur.execute(
+            """
+            SELECT attname FROM pg_attribute
+            WHERE attrelid = to_regclass('queue')
+              AND attname = ANY(%s)
+              AND NOT attisdropped
+              AND NOT attnotnull
+            """,
+            (list(_ATTEMPT_COLUMNS),),
+        )
+        return sorted(r[0] for r in cur.fetchall())
+
+
+def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> list[str]:
+    """Tighten attempts/max_attempts to NOT NULL. Returns the columns altered.
+
+    This closes the gap between queue_ddl(), which declares both NOT NULL, and
+    what the live tables actually have: a NULL in either column makes
+    `attempts < max_attempts` and `attempts >= max_attempts` both NULL, so
+    claim() neither hands the row out nor retires it. Stating the invariant in
+    the schema is the point -- the alternative is a COALESCE in each SQL
+    predicate that reads these columns, which reads as protection while the
+    real guarantee lives, or does not, in the table.
+
+    Opportunistic, unlike the two additive migrations beside it, and the
+    difference is deliberate. `claimed_by` and `next_attempt_at` are
+    PREREQUISITES: the queries name them, so a boot that cannot add them must
+    fail loudly. This is a hardening of a bug that is latent on a table with no
+    NULLs, so **any** database error is reported and skipped rather than
+    crash-looping a fleet, and the next boot tries again. Catching a list of
+    the errors we thought of is not the same promise: a deadlock reaches this
+    before `lock_timeout` does, because `deadlock_timeout` is the shorter of
+    the two on a default server.
+
+    The ALTER itself decides whether the column holds NULLs, because it scans
+    under its own lock and no earlier answer can outlive it; the count is taken
+    afterwards, for the operator's warning.
+
+    One transaction per column, so one blocked column does not hold back its
+    neighbour.
+    """
+
+    def count_nulls(column: str) -> int | None:
+        """How many rows block the ALTER, for the warning. None if unknown.
+
+        Bounded, and its own errors are swallowed: this runs inside a failure
+        handler, so an exception here would replace the error it is explaining
+        and crash the boot -- the same hole as the ALTER's, one level down.
+
+        Identifiers come from _ATTEMPT_COLUMNS via nullable_attempt_columns(),
+        never from a caller.
+        """
+        try:
+            with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
+                cur.execute(f"SELECT count(*) FROM queue WHERE {column} IS NULL")
+                return int(cur.fetchone()[0])
+        except psycopg2.Error as exc:
+            # pgcode only: see the blanket handler below on error text.
+            log.debug("Could not count NULLs", column=column, pgcode=exc.pgcode)
+            return None
+
+    tightened = []
+    for column in nullable_attempt_columns(conn):
+        try:
+            with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
+                cur.execute(f"ALTER TABLE queue ALTER COLUMN {column} SET NOT NULL")
+        except psycopg2.errors.NotNullViolation as exc:
+            log.warning(
+                "Could not tighten a queue attempt column: it holds NULL rows",
+                column=column,
+                pgcode=exc.pgcode,
+                nulls=count_nulls(column),
+                hint="backfill them (attempts -> 0, max_attempts -> "
+                f"{DEFAULT_MAX_ATTEMPTS}); until then claim() can neither hand "
+                "those rows out nor retire them",
+            )
+        except psycopg2.Error as exc:
+            # Everything else, deliberately: a lock timeout, a deadlock, a
+            # missing privilege. The column stays nullable, which is the state
+            # the rest of this package already tolerates.
+            #
+            # message_primary, not str(exc): a psycopg2 error's text includes
+            # the server's DETAIL and CONTEXT lines, and for some error classes
+            # those quote row values -- `Key (x)=(...) already exists`,
+            # `Failing row contains (...)`. This arm catches errors nobody
+            # enumerated, so it must not decide what their text may contain.
+            log.warning(
+                "Could not tighten a queue attempt column",
+                column=column,
+                pgcode=exc.pgcode,
+                error=(exc.diag.message_primary or type(exc).__name__).strip()[:200],
+                hint="the column stays nullable; a later boot retries, though a "
+                "privilege or ownership problem will not clear on its own",
+            )
+        else:
+            tightened.append(column)
+
+    if tightened:
+        log.info("Tightened queue attempt columns to NOT NULL", columns=tightened)
+    return tightened
 
 
 def _partition_name(day: date) -> str:
@@ -1054,6 +1173,18 @@ def fail_or_retry(
         attempts = (row[0] or 0) + 1
         max_attempts = row[1]
         created_at = row[2]
+
+        if max_attempts is None:
+            # Only on a table ensure_attempt_columns_not_null has not tightened
+            # yet, where None on the right of `>=` would raise TypeError.
+            # `is None`, not `or`: max_attempts = 0 means retire on the first
+            # failure.
+            log.warning(
+                "Job has a NULL max_attempts; using the default",
+                job_id=job_id,
+                default=DEFAULT_MAX_ATTEMPTS,
+            )
+            max_attempts = DEFAULT_MAX_ATTEMPTS
 
         if attempts >= max_attempts:
             cur.execute(
