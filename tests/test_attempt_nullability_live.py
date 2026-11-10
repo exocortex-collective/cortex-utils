@@ -147,6 +147,20 @@ def test_a_null_row_blocks_only_its_own_column(legacy) -> None:
     )
 
 
+def test_each_column_is_counted_separately(legacy) -> None:
+    """A constant, or the query pinned to one column name, survived while only
+    one column held exactly one NULL."""
+    _insert(legacy, attempts=None)
+    _insert(legacy, max_attempts=None)
+    _insert(legacy, max_attempts=None)
+
+    with structlog.testing.capture_logs() as logs:
+        assert ensure_attempt_columns_not_null(legacy) == []
+
+    counts = {w["column"]: w["nulls"] for w in _warnings(logs)}
+    assert counts == {"attempts": 1, "max_attempts": 2}
+
+
 def test_a_boot_against_null_rows_still_boots(legacy) -> None:
     """The whole reason this migration is allowed to decline."""
     _insert(legacy, max_attempts=None)
@@ -155,14 +169,25 @@ def test_a_boot_against_null_rows_still_boots(legacy) -> None:
 
 
 def test_a_held_lock_declines_rather_than_crashing_the_boot(legacy, monkeypatch) -> None:
-    """The other decline path, and the one only reachable under contention: the
-    ALTER needs ACCESS EXCLUSIVE on the parent and every partition, which live
-    claim traffic holds. A fleet redeploy must not crash-loop on it.
+    """The decline path only reachable under contention: the ALTER needs ACCESS
+    EXCLUSIVE on the parent and every partition, which live claim traffic
+    holds. A fleet redeploy must not crash-loop on it.
 
-    The timeout is patched down because the real 5s bound is not what is under
-    test -- that the handler catches and declines is.
+    Two bounds, and both earn their place. `lock_timeout` is the one under
+    test, patched down from 5s because its duration is not the subject.
+    `statement_timeout` belongs to the test: without it, a regression that
+    stopped `lock_timeout` applying would leave the ALTER waiting on a lock
+    this same thread holds, so the test would HANG rather than fail -- there is
+    no pytest timeout, and a test that hangs reports nothing. Observed at 70s
+    during review, with the ALTER in wait_event Lock and the blocker idle in
+    transaction. With the bound, that regression cancels the statement and the
+    pgcode assertion below fails instead.
     """
     monkeypatch.setattr(ops, "MIGRATION_LOCK_TIMEOUT_MS", 200)
+    with legacy.cursor() as cur:
+        cur.execute("SET statement_timeout = 5000")
+    legacy.commit()
+
     blocker = psycopg2.connect(DSN)
     try:
         with blocker.cursor() as cur:
@@ -179,7 +204,10 @@ def test_a_held_lock_declines_rather_than_crashing_the_boot(legacy, monkeypatch)
         )
         warnings = _warnings(logs)
         assert [w["column"] for w in warnings] == ["attempts", "max_attempts"], warnings
-        assert all("lock not available" in w["event"] for w in warnings), warnings
+        # 55P03 is lock_not_available. Asserted as a code rather than as a
+        # message: it says the ALTER really lost the lock, where the prose
+        # would also pass for a statement cancelled by the bound above.
+        assert [w["pgcode"] for w in warnings] == ["55P03", "55P03"], warnings
     finally:
         blocker.rollback()
         blocker.close()
@@ -205,10 +233,20 @@ def test_fail_or_retry_does_not_raise_on_a_null_max_attempts(legacy) -> None:
     under a worker that had already claimed it.
     """
     job_id = _insert(legacy, max_attempts=None, status="processing", claimed_by="worker-a")
-    assert fail_or_retry(legacy, job_id, "boom", "worker-a") == "pending"
+    with structlog.testing.capture_logs() as logs:
+        assert fail_or_retry(legacy, job_id, "boom", "worker-a") == "pending"
     with legacy.cursor() as cur:
         cur.execute("SELECT status, attempts, last_error FROM queue WHERE id = %s", (job_id,))
         assert cur.fetchone() == ("pending", 1, "boom")
+    # The substitution must say so: this is the one place that sees the bad row.
+    # Selected by the field only this warning carries -- the ordinary
+    # "scheduled for retry" warning names the same job_id.
+    substituted = [w for w in _warnings(logs) if "default" in w]
+    assert len(substituted) == 1, _warnings(logs)
+    assert (substituted[0]["job_id"], substituted[0]["default"]) == (
+        job_id,
+        DEFAULT_MAX_ATTEMPTS,
+    )
 
 
 def test_the_null_fallback_is_the_default_not_an_excuse_to_retry(legacy) -> None:

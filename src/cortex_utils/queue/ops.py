@@ -372,50 +372,63 @@ def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> lis
     difference is deliberate. `claimed_by` and `next_attempt_at` are
     PREREQUISITES: the queries name them, so a boot that cannot add them must
     fail loudly. This is a hardening of a bug that is latent on a table with no
-    NULLs, so a failure is reported and skipped rather than crash-looping a
-    fleet, and the next boot tries again. Two ways it can fail:
+    NULLs, so **any** database error is reported and skipped rather than
+    crash-looping a fleet, and the next boot tries again. Catching a list of
+    the errors we thought of is not the same promise: NULL rows, a lock
+    timeout, and a deadlock (`deadlock_timeout` is 1s, so it fires BEFORE the
+    5s `lock_timeout`) are three ways this has actually been seen to fail.
 
-    - The column holds NULLs. **The ALTER decides that, not a pre-count.** An
-      earlier version counted first and declined; three reviewers reproduced
-      the hole, because a NULL written between the count and the ALTER made
-      SET NOT NULL raise where only a lock timeout was caught -- the crash loop
-      this function exists to avoid, reached through the guard meant to prevent
-      it. The ALTER scans under its own lock, so it is the only answer that
-      cannot go stale; the count is taken afterwards, for the operator.
-    - The lock is unavailable. The ALTER takes ACCESS EXCLUSIVE on the parent
-      and every partition under continuous claim traffic, so losing that race
-      is normal on a busy fleet redeploy.
+    The ALTER itself decides whether the column holds NULLs, because it scans
+    under its own lock and no earlier answer can outlive it; the count is taken
+    afterwards, for the operator's warning.
 
     One transaction per column, so one blocked column does not hold back its
     neighbour.
     """
 
-    def count_nulls(column: str) -> int:
-        # Failure path only. Identifiers come from _ATTEMPT_COLUMNS via
-        # nullable_attempt_columns(), never from a caller.
-        with _tx(conn) as cur:
-            cur.execute(f"SELECT count(*) FROM queue WHERE {column} IS NULL")
-            return int(cur.fetchone()[0])
+    def count_nulls(column: str) -> int | None:
+        """How many rows block the ALTER, for the warning. None if unknown.
+
+        Bounded, and its own errors are swallowed: this runs inside a failure
+        handler, so an exception here would replace the error it is explaining
+        and crash the boot -- the same hole as the ALTER's, one level down.
+
+        Identifiers come from _ATTEMPT_COLUMNS via nullable_attempt_columns(),
+        never from a caller.
+        """
+        try:
+            with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
+                cur.execute(f"SELECT count(*) FROM queue WHERE {column} IS NULL")
+                return int(cur.fetchone()[0])
+        except psycopg2.Error:
+            return None
 
     tightened = []
     for column in nullable_attempt_columns(conn):
         try:
             with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
                 cur.execute(f"ALTER TABLE queue ALTER COLUMN {column} SET NOT NULL")
-        except psycopg2.errors.NotNullViolation:
+        except psycopg2.errors.NotNullViolation as exc:
             log.warning(
                 "Could not tighten a queue attempt column: it holds NULL rows",
                 column=column,
+                pgcode=exc.pgcode,
                 nulls=count_nulls(column),
                 hint="backfill them (attempts -> 0, max_attempts -> "
                 f"{DEFAULT_MAX_ATTEMPTS}); until then claim() can neither hand "
                 "those rows out nor retire them",
             )
-        except psycopg2.errors.LockNotAvailable:
+        except psycopg2.Error as exc:
+            # Everything else, deliberately: a lock timeout, a deadlock, a
+            # missing privilege. The column stays nullable, which is the state
+            # the rest of this package already tolerates, and the next boot
+            # tries again -- so there is nothing here worth a crash loop over.
             log.warning(
-                "Could not tighten a queue attempt column: lock not available",
+                "Could not tighten a queue attempt column",
                 column=column,
-                hint="live claim traffic holds the parent; retried on the next boot",
+                pgcode=exc.pgcode,
+                error=str(exc).strip()[:200],
+                hint="retried on the next boot",
             )
         else:
             tightened.append(column)
@@ -1155,11 +1168,9 @@ def fail_or_retry(
 
         if max_attempts is None:
             # Only on a table ensure_attempt_columns_not_null has not tightened
-            # yet. `is None`, not `or`: max_attempts = 0 means retire on the
-            # first failure, and `or` granted it three attempts instead.
-            # Untreated, None on the right of `>=` raises TypeError inside _tx,
-            # which rolls back -- so the job stays `processing` and its failure
-            # is never recorded.
+            # yet, where None on the right of `>=` would raise TypeError.
+            # `is None`, not `or`: max_attempts = 0 means retire on the first
+            # failure.
             log.warning(
                 "Job has a NULL max_attempts; using the default",
                 job_id=job_id,
