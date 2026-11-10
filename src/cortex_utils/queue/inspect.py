@@ -69,18 +69,9 @@ class QueueDepth:
     oldest_ready_age_s: float | None
 
     max_recoveries: int
-    """The highest recovery count on any LIVE row in this queue.
+    """The highest recovery count on any live row (pending or processing).
 
-    A job that kills its worker never reaches fail_or_retry, so it returns to
-    pending with its attempts intact and can cycle forever. This is the number
-    that moves when that happens, and the only one that does -- depths stay
-    flat, because the row is pending again each time round.
-
-    Live rows only (pending or processing): a completed row recovered twice
-    survived a worker restart and finished, which is the mechanism working. A
-    single-digit value here is ordinary redeploy churn; a value that climbs on
-    one queue while its depths hold steady is a poison pill. Use stuck() to see
-    which row.
+    How to read it against the depths: `docs/queue-api.md`, under claim().
     """
 
 
@@ -177,11 +168,7 @@ class StuckJob:
     stuck_for_s: float
     attempts: int
     recoveries: int
-    """How many times this row has been recovered from a dead claimant.
-
-    High here with `attempts` low is the poison-pill signature: the work keeps
-    killing its worker, so it is never charged an attempt and never retires.
-    """
+    """How many times this row has been recovered from a dead claimant."""
 
 
 @dataclass(frozen=True)

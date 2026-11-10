@@ -44,9 +44,8 @@ SCHEMA = "t_recoveries"
 
 VIS = 30  # minutes; the default claim() window
 
-# A teardown DROP SCHEMA that cannot get its lock must FAIL rather than hang:
-# an unbounded wait here is indistinguishable from a broken suite, which is
-# how this file's first run burned 43 minutes before anyone could see why.
+# A DROP SCHEMA that cannot get its lock must FAIL rather than hang: an
+# unbounded wait is indistinguishable from a broken suite.
 LOCK_TIMEOUT_MS = 10_000
 
 
@@ -74,11 +73,7 @@ def conn():
         finally:
             # rollback() first, unconditionally: psycopg2 refuses to change
             # autocommit while a transaction is open, so a test that left one
-            # behind would make this teardown RAISE -- and with close() in the
-            # same block it would then be skipped, leaking a backend that holds
-            # AccessShareLock on `queue` and wedging the next test's DROP SCHEMA
-            # for good. That is the 43-minute hang this file opened with, so
-            # close() lives in its own finally and runs whatever else fails.
+            # behind makes this teardown raise before the DROP SCHEMA.
             c.rollback()
             c.autocommit = True
             with c.cursor() as cur:
@@ -243,21 +238,58 @@ def test_recoveries_are_counted_per_queue(conn) -> None:
     """
     mine = enqueue(conn, "q", {"x": 1})
     theirs = enqueue(conn, "other", {"x": 1})
+    spent = enqueue(conn, "other", {"x": "exhausted"})
     conn.commit()
     assert claim(conn, "q", "worker-a", visibility_timeout_min=VIS)
-    assert claim(conn, "other", "worker-a", visibility_timeout_min=VIS)
+    assert claim(conn, "other", "worker-a", limit=2, visibility_timeout_min=VIS)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE queue SET attempts = max_attempts WHERE id = %s", (spent,))
+    conn.commit()
 
     _abandon(conn, mine)
     _abandon(conn, theirs)
+    _abandon(conn, spent)
     claim(conn, "q", "worker-b", visibility_timeout_min=VIS)
 
     assert _row(conn, mine) == (1, 0, "pending"), "the claimed queue's row"
     assert _row(conn, theirs) == (0, 0, "processing"), (
         "the other queue's row is equally stale and must be untouched"
     )
+    # Each of the three CTEs in that one statement is scoped by queue_name, and
+    # each needs its own stale row in the other queue to prove it: reset_stale
+    # by `theirs`, retire_exhausted by `spent` -- which is stale AND out of
+    # attempts, so it is the row the retire branch would claim.
+    assert _row(conn, spent)[2] == "processing", (
+        "retire_exhausted must not reach another queue's exhausted row"
+    )
 
     depths = {d.queue_name: d for d in health(conn).depths}
     assert (depths["q"].max_recoveries, depths["other"].max_recoveries) == (1, 0)
+
+    # And claimable: `mine` is now the only pending row in "q", so a claim on
+    # "other" must return nothing rather than reaching across.
+    assert claim(conn, "other", "worker-c", visibility_timeout_min=VIS) == [], (
+        "claimable must not return another queue's pending row"
+    )
+
+
+def test_a_batch_of_stale_rows_is_each_recovered_once(conn) -> None:
+    """One statement, several dead claims: each row counts one recovery.
+
+    `reset_stale` is not bounded by `limit` -- it resets every stale row in the
+    queue, which is the realistic shape when one crash takes several workers
+    with it. A per-statement increment that fired once, or once per row reset,
+    would both read as 1 on the single-row tests every other case here uses.
+    """
+    ids = [enqueue(conn, "q", {"x": n}) for n in range(3)]
+    conn.commit()
+    assert len(claim(conn, "q", "worker-a", limit=3, visibility_timeout_min=VIS)) == 3
+    for job_id in ids:
+        _abandon(conn, job_id)
+
+    claim(conn, "q", "worker-b", visibility_timeout_min=VIS)
+
+    assert [_row(conn, i)[0] for i in ids] == [1, 1, 1]
 
 
 def test_health_reports_the_worst_row_not_the_total(conn) -> None:

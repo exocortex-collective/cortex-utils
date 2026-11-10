@@ -190,7 +190,7 @@ def test_stuck_reports_who_holds_the_claim() -> None:
     assert job.claimed_by == "worker-a"
     assert job.stuck_for_s == 120.0
     # Positional unpack, so this row has to carry every column the SELECT
-    # names. It silently did not while the field had a default, and read 0.
+    # names, in order.
     assert (job.attempts, job.recoveries) == (2, 4)
 
 

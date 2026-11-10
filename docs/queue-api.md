@@ -144,8 +144,7 @@ The cost, stated because it is real: a job that kills the worker for its *own*
 reasons — OOM, segfault, an unhandled crash — never reaches `fail_or_retry()`
 either. So it cycles claim → crash → recovery → claim indefinitely with its
 budget intact. The older attempts-consuming semantics self-limited poison
-pills; this one does not, deliberately — an expired claim token should not
-spend a retry.
+pills; this one does not.
 
 The loop is **counted** instead. Each recovery increments `queue.recoveries`,
 which is deliberately not `attempts`: the budget still survives a dead
