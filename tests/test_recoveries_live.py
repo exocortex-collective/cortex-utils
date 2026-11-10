@@ -278,8 +278,7 @@ def test_a_batch_of_stale_rows_is_each_recovered_once(conn) -> None:
 
     `reset_stale` is not bounded by `limit` -- it resets every stale row in the
     queue, which is the realistic shape when one crash takes several workers
-    with it. A per-statement increment that fired once, or once per row reset,
-    would both read as 1 on the single-row tests every other case here uses.
+    with it.
     """
     ids = [enqueue(conn, "q", {"x": n}) for n in range(3)]
     conn.commit()
@@ -349,18 +348,15 @@ def test_a_table_predating_the_column_is_migrated_not_refused(conn) -> None:
     deliberately, so a half-migrated shape fails loudly. Adding the column to
     only the required set would therefore have raised on every existing
     production table, crash-looping the fleet on boot.
+
+    Nothing here may add the column before ensure_queue_schema() runs: the boot
+    path has to be what migrates it, or this test passes with `recoveries` out
+    of _MIGRATED_COLUMNS and the fleet crash-loops anyway.
     """
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE queue DROP COLUMN recoveries")
     conn.commit()
     assert has_recoveries_column(conn) is False, "precondition"
-
-    assert ensure_recoveries_column(conn) is True, "it reports having added it"
-    assert ensure_recoveries_column(conn) is False, (
-        "and reports declining the second time -- services call this on every "
-        "boot, so the pre-check is what keeps the ALTER's ACCESS EXCLUSIVE lock "
-        "off the steady-state path"
-    )
 
     ensure_queue_schema(conn)
 
@@ -380,3 +376,15 @@ def test_a_table_predating_the_column_is_migrated_not_refused(conn) -> None:
     claim(conn, "q", "worker-a", visibility_timeout_min=VIS)
     _crash_cycle(conn, job_id)
     assert _row(conn, job_id)[0] == 1
+
+
+def test_the_column_migration_declines_once_the_column_is_there(conn) -> None:
+    """Services call ensure_recoveries_column() on every boot, so the pre-check
+    is what keeps the ALTER's ACCESS EXCLUSIVE lock off the steady-state path.
+    """
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE queue DROP COLUMN recoveries")
+    conn.commit()
+
+    assert ensure_recoveries_column(conn) is True, "it reports having added it"
+    assert ensure_recoveries_column(conn) is False, "and declines the second time"
