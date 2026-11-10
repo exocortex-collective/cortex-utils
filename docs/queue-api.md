@@ -144,12 +144,12 @@ The cost, stated because it is real: a job that kills the worker for its *own*
 reasons — OOM, segfault, an unhandled crash — never reaches `fail_or_retry()`
 either. So it cycles claim → crash → recovery → claim indefinitely with its
 budget intact. The older attempts-consuming semantics self-limited poison
-pills; this one does not, and it never will — the semantics are the right ones
-for the case they were chosen for.
+pills; this one does not, deliberately — an expired claim token should not
+spend a retry.
 
-What changed (cortex-wh3b) is that the loop is now **counted**. Each recovery
-increments `queue.recoveries`, which is deliberately not `attempts`: the
-budget still survives a dead claimant, but the cycling is no longer silent.
+The loop is **counted** instead. Each recovery increments `queue.recoveries`,
+which is deliberately not `attempts`: the budget still survives a dead
+claimant, but the cycling is not silent.
 
 | Where | What you see |
 |---|---|

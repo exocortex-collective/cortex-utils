@@ -364,9 +364,9 @@ def ensure_recoveries_column(conn: psycopg2.extensions.connection) -> bool:
     parent under live claim traffic, and running it unconditionally would queue
     that lock behind real work on every redeploy.
 
-    DEFAULT 0 rather than NULL so claim() can increment without a backfill
-    step. Postgres 11+ stores a non-volatile default in the catalogue, so this
-    does not rewrite the table.
+    NOT NULL DEFAULT 0 rather than nullable, so every pre-existing row starts
+    at 0 and needs no backfill. Postgres 11+ stores a constant default in the
+    catalogue, so this does not rewrite the table.
     """
     if has_recoveries_column(conn):
         return False

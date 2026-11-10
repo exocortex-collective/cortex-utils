@@ -28,6 +28,7 @@ from cortex_utils.queue.ops import (  # noqa: E402
     claim,
     complete,
     enqueue,
+    ensure_recoveries_column,
     has_recoveries_column,
     release,
 )
@@ -43,36 +44,46 @@ SCHEMA = "t_recoveries"
 
 VIS = 30  # minutes; the default claim() window
 
+# A teardown DROP SCHEMA that cannot get its lock must FAIL rather than hang:
+# an unbounded wait here is indistinguishable from a broken suite, which is
+# how this file's first run burned 43 minutes before anyone could see why.
+LOCK_TIMEOUT_MS = 10_000
+
 
 @pytest.fixture
 def conn():
     """One connection on a private schema. Nothing here needs a race."""
     c = psycopg2.connect(DSN)
-    c.autocommit = True
-    with c.cursor() as cur:
-        cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
-        cur.execute(f"CREATE SCHEMA {SCHEMA}")
-        cur.execute(f"SET search_path = {SCHEMA}")
-        cur.execute(queue_ddl())
-        cur.execute("SELECT CURRENT_DATE")
-        day = cur.fetchone()[0]
-        cur.execute(
-            f"CREATE TABLE queue_{day:%Y_%m_%d} PARTITION OF queue "
-            f"FOR VALUES FROM ('{day}') TO ('{day + timedelta(days=1)}')"
-        )
-    c.autocommit = False
     try:
-        yield c
-    finally:
-        # rollback() first, unconditionally: psycopg2 refuses to change
-        # autocommit while a transaction is open, so a test that left one
-        # behind would make this teardown RAISE and never close the
-        # connection -- leaking a backend that holds AccessShareLock on
-        # `queue` and wedging the next test's DROP SCHEMA for good.
-        c.rollback()
         c.autocommit = True
         with c.cursor() as cur:
+            cur.execute(f"SET lock_timeout = '{LOCK_TIMEOUT_MS}ms'")
             cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            cur.execute(f"CREATE SCHEMA {SCHEMA}")
+            cur.execute(f"SET search_path = {SCHEMA}")
+            cur.execute(queue_ddl())
+            cur.execute("SELECT CURRENT_DATE")
+            day = cur.fetchone()[0]
+            cur.execute(
+                f"CREATE TABLE queue_{day:%Y_%m_%d} PARTITION OF queue "
+                f"FOR VALUES FROM ('{day}') TO ('{day + timedelta(days=1)}')"
+            )
+        c.autocommit = False
+        try:
+            yield c
+        finally:
+            # rollback() first, unconditionally: psycopg2 refuses to change
+            # autocommit while a transaction is open, so a test that left one
+            # behind would make this teardown RAISE -- and with close() in the
+            # same block it would then be skipped, leaking a backend that holds
+            # AccessShareLock on `queue` and wedging the next test's DROP SCHEMA
+            # for good. That is the 43-minute hang this file opened with, so
+            # close() lives in its own finally and runs whatever else fails.
+            c.rollback()
+            c.autocommit = True
+            with c.cursor() as cur:
+                cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+    finally:
         c.close()
 
 
@@ -221,6 +232,68 @@ def test_health_reports_the_worst_live_count_per_queue(conn) -> None:
     )
 
 
+def test_recoveries_are_counted_per_queue(conn) -> None:
+    """A recovery belongs to the queue whose row was reset, and to no other.
+
+    `reset_stale` is scoped by `queue_name` for the same reason the whole claim
+    is: one worker's visibility window says nothing about another queue's rows.
+    Drop that scope and a busy queue's recovery lands on every quiet queue in
+    the table -- every per-queue figure wrong at once, in the direction that
+    invents loops that are not happening.
+    """
+    mine = enqueue(conn, "q", {"x": 1})
+    theirs = enqueue(conn, "other", {"x": 1})
+    conn.commit()
+    assert claim(conn, "q", "worker-a", visibility_timeout_min=VIS)
+    assert claim(conn, "other", "worker-a", visibility_timeout_min=VIS)
+
+    _abandon(conn, mine)
+    _abandon(conn, theirs)
+    claim(conn, "q", "worker-b", visibility_timeout_min=VIS)
+
+    assert _row(conn, mine) == (1, 0, "pending"), "the claimed queue's row"
+    assert _row(conn, theirs) == (0, 0, "processing"), (
+        "the other queue's row is equally stale and must be untouched"
+    )
+
+    depths = {d.queue_name: d for d in health(conn).depths}
+    assert (depths["q"].max_recoveries, depths["other"].max_recoveries) == (1, 0)
+
+
+def test_health_reports_the_worst_row_not_the_total(conn) -> None:
+    """Two live rows, different counts: the queue's figure is the WORST row.
+
+    A total would climb with the number of rows that have ever been recovered,
+    which is ordinary churn, instead of with how badly any single row is
+    looping -- the one thing this column exists to show.
+
+    The worst row here is `pending`, which is also the point: a recovered row
+    sits pending until something claims it again, so counting only
+    'processing' would report the healthier row and hide the loop entirely.
+    """
+    worse = enqueue(conn, "q", {"x": "loops"})
+    better = enqueue(conn, "q", {"x": "once"})
+    conn.commit()
+    claim(conn, "q", "worker-a", visibility_timeout_min=VIS)
+    claim(conn, "q", "worker-a", visibility_timeout_min=VIS)
+
+    # Each claim resets every stale row in the queue and claims whatever was
+    # already pending, so these three calls leave `worse` on 2 and `better` on 1.
+    _abandon(conn, worse)
+    claim(conn, "q", "worker-b", visibility_timeout_min=VIS)
+    _abandon(conn, better)
+    claim(conn, "q", "worker-b", visibility_timeout_min=VIS)
+    _abandon(conn, worse)
+    claim(conn, "q", "worker-b", visibility_timeout_min=VIS)
+
+    assert _row(conn, worse)[0] == 2, "precondition: counts differ"
+    assert _row(conn, better)[0] == 1
+    assert _row(conn, worse)[2] == "pending", "precondition: the worst row is the pending one"
+
+    depths = {d.queue_name: d for d in health(conn).depths}
+    assert depths["q"].max_recoveries == 2, "the worst row, not the sum (3)"
+
+
 def test_stuck_reports_recoveries_for_the_row(conn) -> None:
     """health() says a queue is looping; stuck() says which row. High
     recoveries with low attempts is the signature."""
@@ -243,13 +316,19 @@ def test_a_table_predating_the_column_is_migrated_not_refused(conn) -> None:
     ensure_queue_schema() REFUSES a table missing a column no migration adds --
     deliberately, so a half-migrated shape fails loudly. Adding the column to
     only the required set would therefore have raised on every existing
-    production table, crash-looping the fleet on boot: the exact failure mode
-    the sibling attempt-nullability work had just hardened against.
+    production table, crash-looping the fleet on boot.
     """
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE queue DROP COLUMN recoveries")
     conn.commit()
     assert has_recoveries_column(conn) is False, "precondition"
+
+    assert ensure_recoveries_column(conn) is True, "it reports having added it"
+    assert ensure_recoveries_column(conn) is False, (
+        "and reports declining the second time -- services call this on every "
+        "boot, so the pre-check is what keeps the ALTER's ACCESS EXCLUSIVE lock "
+        "off the steady-state path"
+    )
 
     ensure_queue_schema(conn)
 

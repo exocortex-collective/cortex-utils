@@ -53,13 +53,9 @@ REQUIRED_COLUMNS: dict[str, str] = {
     "status": "TEXT NOT NULL DEFAULT 'pending'",
     "priority": "INT NOT NULL DEFAULT 0",
     "attempts": "INT NOT NULL DEFAULT 0",
-    # Stale-claim recoveries, deliberately NOT attempts. A job that kills its
-    # worker outright never reaches fail_or_retry, so it cycles
-    # claim -> crash -> visibility reset -> claim with its budget intact. That
-    # is the right call for an expired token and the wrong one for a poison
-    # pill, and before this column nothing in the system counted the
-    # difference: no depth moved, health() showed nothing, and the only
-    # signature was worker churn.
+    # Stale-claim recoveries, deliberately NOT attempts: a job that kills its
+    # worker never reaches fail_or_retry, so it cycles with its budget intact
+    # and no depth moves. This is the only number that does.
     "recoveries": "INT NOT NULL DEFAULT 0",
     "max_attempts": f"INT NOT NULL DEFAULT {DEFAULT_MAX_ATTEMPTS}",
     "last_error": "TEXT",
@@ -403,7 +399,7 @@ def _ensure_queue_schema_locked(
     exists, _partitioned, missing = _inspect(conn, "queue")
 
     if exists:
-        # Refuse before altering anything if the shape is wrong in a way the two
+        # Refuse before altering anything if the shape is wrong in a way the
         # additive migrations cannot fix. _inspect already told us, in the same
         # round trip, and doing the ALTERs first would take ACCESS EXCLUSIVE
         # twice and build an index before raising about a column neither step

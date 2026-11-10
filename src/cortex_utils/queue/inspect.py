@@ -68,7 +68,7 @@ class QueueDepth:
     failed: int
     oldest_ready_age_s: float | None
 
-    max_recoveries: int = 0
+    max_recoveries: int
     """The highest recovery count on any LIVE row in this queue.
 
     A job that kills its worker never reaches fail_or_retry, so it returns to
@@ -176,7 +176,7 @@ class StuckJob:
     claimed_at: datetime
     stuck_for_s: float
     attempts: int
-    recoveries: int = 0
+    recoveries: int
     """How many times this row has been recovered from a dead claimant.
 
     High here with `attempts` low is the poison-pill signature: the work keeps

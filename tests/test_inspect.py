@@ -185,10 +185,13 @@ def test_stuck_measures_the_window_on_the_server() -> None:
 def test_stuck_reports_who_holds_the_claim() -> None:
     """The difference between 'a worker is chewing on it' and 'a worker died
     holding it'."""
-    conn = _conn(fetchall=[(1, "triage", "worker-a", NOW, 120.0, 2)])
+    conn = _conn(fetchall=[(1, "triage", "worker-a", NOW, 120.0, 2, 4)])
     job = stuck(conn)[0]
     assert job.claimed_by == "worker-a"
     assert job.stuck_for_s == 120.0
+    # Positional unpack, so this row has to carry every column the SELECT
+    # names. It silently did not while the field had a default, and read 0.
+    assert (job.attempts, job.recoveries) == (2, 4)
 
 
 # --- failures ---------------------------------------------------------------
