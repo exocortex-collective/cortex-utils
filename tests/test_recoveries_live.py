@@ -368,8 +368,6 @@ def test_a_table_predating_the_column_is_migrated_not_refused(conn) -> None:
         )
         assert cur.fetchone()[0] is True, "added NOT NULL so claim() can increment"
 
-    # And the added column is usable immediately, with no backfill step: the
-    # increment reads COALESCE(recoveries, 0).
     job_id = enqueue(conn, "q", {"x": 1})
     conn.commit()
     claim(conn, "q", "worker-a", visibility_timeout_min=VIS)
@@ -383,9 +381,7 @@ def test_a_populated_table_predating_the_column_starts_its_rows_at_zero(
     """The populated case, which an empty table cannot reach.
 
     ADD COLUMN ... NOT NULL without a DEFAULT fails outright on a POPULATED
-    table where on an empty one it succeeds, so this reaches a different
-    statement from the migration test above, whose queue is empty when the
-    column is dropped. A redeploy can meet either.
+    table where on an empty one it succeeds.
     """
     job_id = enqueue(conn, "q", {"x": 1})
     conn.commit()
