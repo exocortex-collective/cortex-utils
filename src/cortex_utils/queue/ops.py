@@ -374,9 +374,9 @@ def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> lis
     fail loudly. This is a hardening of a bug that is latent on a table with no
     NULLs, so **any** database error is reported and skipped rather than
     crash-looping a fleet, and the next boot tries again. Catching a list of
-    the errors we thought of is not the same promise, and the list was wrong
-    twice: a deadlock reaches this before `lock_timeout` does, because
-    `deadlock_timeout` is the shorter of the two on a default server.
+    the errors we thought of is not the same promise: a deadlock reaches this
+    before `lock_timeout` does, because `deadlock_timeout` is the shorter of
+    the two on a default server.
 
     The ALTER itself decides whether the column holds NULLs, because it scans
     under its own lock and no earlier answer can outlive it; the count is taken
@@ -434,7 +434,7 @@ def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> lis
                 "Could not tighten a queue attempt column",
                 column=column,
                 pgcode=exc.pgcode,
-                error=(exc.diag.message_primary or "").strip()[:200],
+                error=(exc.diag.message_primary or type(exc).__name__).strip()[:200],
                 hint="the column stays nullable; a later boot retries, though a "
                 "privilege or ownership problem will not clear on its own",
             )

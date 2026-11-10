@@ -163,11 +163,11 @@ def test_a_count_it_cannot_run_reports_the_nulls_as_unknown(legacy) -> None:
     """count_nulls exists to explain a failed ALTER, so its own failure must not
     replace the error it is explaining.
 
-    Reachable without stubbing the count, which is the opposite of what I first
-    claimed: the ALTER needs ownership and the count needs SELECT, and an owner
-    can revoke SELECT from itself, so the two failures need nothing
-    contradictory. `attempts` is still tightened; `max_attempts` declines with
-    its NULL count unknown rather than crashing the boot.
+    Reachable without stubbing the count: the ALTER needs ownership and the
+    count needs SELECT, and an owner can revoke SELECT from itself, so the two
+    failures need nothing contradictory. `attempts` is still tightened;
+    `max_attempts` declines with its NULL count unknown rather than crashing
+    the boot.
 
     Creates a role, so it needs a cluster you can throw away -- which is what
     CORTEX_TEST_DSN is.
@@ -254,6 +254,43 @@ def test_a_held_lock_declines_rather_than_crashing_the_boot(legacy, monkeypatch)
     finally:
         blocker.rollback()
         blocker.close()
+
+
+def test_the_warning_carries_the_message_and_never_the_detail(legacy) -> None:
+    """A psycopg2 error's `str()` includes the server's DETAIL line, and for
+    some error classes DETAIL quotes row values -- `Key (x)=(...)`, `Failing
+    row contains (...)`. This table holds mail metadata, so the blanket arm
+    logs `diag.message_primary` instead, and that property needs pinning or a
+    later refactor reintroduces the leak silently.
+
+    An event trigger is how you make an ALTER fail with a DETAIL attached.
+    It is database-global while installed, so it would also refuse a
+    concurrent run's ALTER TABLE; CI runs these serially.
+    """
+    with legacy.cursor() as cur:
+        cur.execute(
+            "CREATE FUNCTION refuse_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ "
+            "BEGIN RAISE EXCEPTION 'ddl refused' USING DETAIL = 'SENSITIVE-ROW-VALUE'; END $$"
+        )
+        cur.execute(
+            "CREATE EVENT TRIGGER t_attempts_refuse ON ddl_command_start "
+            "WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION refuse_ddl()"
+        )
+    legacy.commit()
+    try:
+        with structlog.testing.capture_logs() as logs:
+            assert ensure_attempt_columns_not_null(legacy) == []
+
+        warnings = _warnings(logs)
+        assert [w["error"] for w in warnings] == ["ddl refused"] * 2, warnings
+        assert "SENSITIVE-ROW-VALUE" not in repr(logs), (
+            "the DETAIL line is what must never reach a log on this host"
+        )
+    finally:
+        with legacy.cursor() as cur:
+            cur.execute("DROP EVENT TRIGGER IF EXISTS t_attempts_refuse")
+            cur.execute("DROP FUNCTION IF EXISTS refuse_ddl()")
+        legacy.commit()
 
 
 def test_a_null_max_attempts_row_is_stuck_pending(legacy) -> None:
