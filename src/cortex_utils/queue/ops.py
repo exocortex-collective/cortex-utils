@@ -73,19 +73,11 @@ log = get_logger()
 DEFAULT_VISIBILITY_TIMEOUT_MIN = 30
 ERROR_MAX_CHARS = 2000
 
-# The attempt budget a row gets when nothing said otherwise. This is the DDL's
-# DEFAULT, kept here rather than in schema.py because schema.py imports ops and
-# not the reverse, and because the Python fallback in fail_or_retry has to agree
-# with the column default to mean anything.
+# The DDL's DEFAULT, kept here and not in schema.py because schema.py imports
+# ops and not the reverse.
 DEFAULT_MAX_ATTEMPTS = 3
 
-# The two columns every attempt predicate reads, and the ones production is
-# missing NOT NULL on. queue_ddl() declares both NOT NULL; the live tables came
-# from postmark's bootstrap DDL, which declared only the DEFAULTs, and the two
-# additive migrations here never tightened them. A NULL in either makes
-# `attempts < max_attempts` AND `attempts >= max_attempts` both NULL, so claim()
-# will neither hand the row out nor retire it: pending forever, absent from
-# failures(), pinning its partition against retention.
+# The columns ensure_attempt_columns_not_null() tightens.
 _ATTEMPT_COLUMNS = ("attempts", "max_attempts")
 
 # ALTER TABLE on a partitioned parent takes ACCESS EXCLUSIVE and cascades to
@@ -369,66 +361,68 @@ def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> lis
     """Tighten attempts/max_attempts to NOT NULL. Returns the columns altered.
 
     This closes the gap between queue_ddl(), which declares both NOT NULL, and
-    what the live tables actually have. Stating the invariant in the schema is
-    the point: the alternative is a COALESCE in each of the five SQL predicates
-    that read these columns, which reads as protection while the real guarantee
-    lives -- or does not -- in the table.
+    what the live tables actually have: a NULL in either column makes
+    `attempts < max_attempts` and `attempts >= max_attempts` both NULL, so
+    claim() neither hands the row out nor retires it. Stating the invariant in
+    the schema is the point -- the alternative is a COALESCE in each SQL
+    predicate that reads these columns, which reads as protection while the
+    real guarantee lives, or does not, in the table.
 
     Opportunistic, unlike the two additive migrations beside it, and the
     difference is deliberate. `claimed_by` and `next_attempt_at` are
     PREREQUISITES: the queries name them, so a boot that cannot add them must
-    fail loudly. NOT NULL is a HARDENING of a bug that is latent on a table with
-    no NULLs, so every way this can fail is reported and skipped rather than
-    crash-looping a fleet over a row that does not exist:
+    fail loudly. This is a hardening of a bug that is latent on a table with no
+    NULLs, so a failure is reported and skipped rather than crash-looping a
+    fleet, and the next boot tries again. Two ways it can fail:
 
-    - NULLs already present: the ALTER would fail anyway, and tightening
-      silently is not on offer. Logged with the counts so an operator can
-      backfill, and re-attempted on the next boot.
-    - lock_timeout: the ALTER takes ACCESS EXCLUSIVE on the parent and every
-      partition under continuous claim traffic. Losing that race is normal on a
-      busy fleet redeploy; the next boot tries again.
+    - The column holds NULLs. **The ALTER decides that, not a pre-count.** An
+      earlier version counted first and declined; three reviewers reproduced
+      the hole, because a NULL written between the count and the ALTER made
+      SET NOT NULL raise where only a lock timeout was caught -- the crash loop
+      this function exists to avoid, reached through the guard meant to prevent
+      it. The ALTER scans under its own lock, so it is the only answer that
+      cannot go stale; the count is taken afterwards, for the operator.
+    - The lock is unavailable. The ALTER takes ACCESS EXCLUSIVE on the parent
+      and every partition under continuous claim traffic, so losing that race
+      is normal on a busy fleet redeploy.
+
+    One transaction per column, so one blocked column does not hold back its
+    neighbour.
     """
-    pending = nullable_attempt_columns(conn)
-    if not pending:
-        return []
 
-    with _tx(conn) as cur:
-        # One scan answers for both columns. Only reached while the ALTER is
-        # still outstanding -- once it lands, the catalogue probe above returns
-        # early and this costs nothing on the steady-state boot path.
-        cur.execute(
-            "SELECT "
-            # Identifiers come from _ATTEMPT_COLUMNS, never from a caller.
-            + ", ".join(f"count(*) FILTER (WHERE {c} IS NULL)" for c in pending)
-            + " FROM queue"
-        )
-        nulls = dict(zip(pending, cur.fetchone(), strict=True))
+    def count_nulls(column: str) -> int:
+        # Failure path only. Identifiers come from _ATTEMPT_COLUMNS via
+        # nullable_attempt_columns(), never from a caller.
+        with _tx(conn) as cur:
+            cur.execute(f"SELECT count(*) FROM queue WHERE {column} IS NULL")
+            return int(cur.fetchone()[0])
 
-    blocked = {c: n for c, n in nulls.items() if n}
-    if blocked:
-        log.warning(
-            "queue attempt columns still allow NULL and hold NULL rows; not tightening them",
-            nulls=blocked,
-            hint="backfill these rows (attempts -> 0, max_attempts -> "
-            f"{DEFAULT_MAX_ATTEMPTS}); until then claim() can neither hand them "
-            "out nor retire them",
-        )
-        return []
-
-    try:
-        with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
-            for column in pending:
+    tightened = []
+    for column in nullable_attempt_columns(conn):
+        try:
+            with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
                 cur.execute(f"ALTER TABLE queue ALTER COLUMN {column} SET NOT NULL")
-    except psycopg2.errors.LockNotAvailable:
-        log.warning(
-            "Could not tighten queue attempt columns: lock not available",
-            columns=pending,
-            hint="live claim traffic holds the parent; retried on the next boot",
-        )
-        return []
+        except psycopg2.errors.NotNullViolation:
+            log.warning(
+                "Could not tighten a queue attempt column: it holds NULL rows",
+                column=column,
+                nulls=count_nulls(column),
+                hint="backfill them (attempts -> 0, max_attempts -> "
+                f"{DEFAULT_MAX_ATTEMPTS}); until then claim() can neither hand "
+                "those rows out nor retire them",
+            )
+        except psycopg2.errors.LockNotAvailable:
+            log.warning(
+                "Could not tighten a queue attempt column: lock not available",
+                column=column,
+                hint="live claim traffic holds the parent; retried on the next boot",
+            )
+        else:
+            tightened.append(column)
 
-    log.info("Tightened queue attempt columns to NOT NULL", columns=pending)
-    return pending
+    if tightened:
+        log.info("Tightened queue attempt columns to NOT NULL", columns=tightened)
+    return tightened
 
 
 def _partition_name(day: date) -> str:
@@ -1156,15 +1150,22 @@ def fail_or_retry(
             return "stale"
 
         attempts = (row[0] or 0) + 1
-        # `or DEFAULT_MAX_ATTEMPTS`, matching its neighbour above: on a table
-        # whose max_attempts is still nullable, a NULL here put None on the
-        # right of `>=` and raised TypeError inside _tx. That rolled the
-        # transaction back, so the job stayed `processing`, the failure was
-        # never recorded in last_error, and the worker saw a type error from the
-        # queue library instead of its own job's error. One column was defended
-        # and its neighbour was not.
-        max_attempts = row[1] or DEFAULT_MAX_ATTEMPTS
+        max_attempts = row[1]
         created_at = row[2]
+
+        if max_attempts is None:
+            # Only on a table ensure_attempt_columns_not_null has not tightened
+            # yet. `is None`, not `or`: max_attempts = 0 means retire on the
+            # first failure, and `or` granted it three attempts instead.
+            # Untreated, None on the right of `>=` raises TypeError inside _tx,
+            # which rolls back -- so the job stays `processing` and its failure
+            # is never recorded.
+            log.warning(
+                "Job has a NULL max_attempts; using the default",
+                job_id=job_id,
+                default=DEFAULT_MAX_ATTEMPTS,
+            )
+            max_attempts = DEFAULT_MAX_ATTEMPTS
 
         if attempts >= max_attempts:
             cur.execute(

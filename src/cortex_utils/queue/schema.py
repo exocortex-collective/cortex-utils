@@ -410,9 +410,8 @@ def _ensure_queue_schema_locked(
         # one. A fresh database gets every column from queue_ddl() instead.
         add_retry_columns(conn, dry_run=False)
         ensure_claim_token_column(conn)
-        # Last of the three, and the only one that may decline: the columns
-        # already exist here, so this is a tightening rather than something a
-        # query needs in order to run. See ensure_attempt_columns_not_null.
+        # The only one of the three that may decline -- it tightens a
+        # constraint rather than adding a column a query names.
         ensure_attempt_columns_not_null(conn)
 
     result = ensure_queue_table(conn, extra_indexes=extra_indexes)

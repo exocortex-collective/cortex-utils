@@ -65,10 +65,8 @@ jobs:
         # exit 0. Disabling the plugin turns each skip into an error, so the
         # step exits 1 with no DSN and 0 with one.
         run: |
-          # Globbed, not listed. The list was six files and a new live suite
-          # joined the suite without joining the guard -- so the one step that
-          # exists to stop live coverage becoming silent skips was itself
-          # missing a file. The shell fails loudly if nothing matches.
+          # Globbed, not listed: a hand-maintained list had already lost
+          # test_partitions_live.py. pytest exits non-zero if nothing matches.
           uv run pytest tests/test_*_live.py \
             -q --no-header -p no:cacheprovider -p no:skipping
 
