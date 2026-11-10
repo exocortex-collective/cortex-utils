@@ -65,9 +65,11 @@ jobs:
         # exit 0. Disabling the plugin turns each skip into an error, so the
         # step exits 1 with no DSN and 0 with one.
         run: |
-          uv run pytest tests/test_inspect_live.py tests/test_ops_live.py \
-            tests/test_dead_letter_live.py tests/test_claim_token_guard_live.py \
-            tests/test_schema_live.py tests/test_import_staging_live.py \
+          # Globbed, not listed. The list was six files and a new live suite
+          # joined the suite without joining the guard -- so the one step that
+          # exists to stop live coverage becoming silent skips was itself
+          # missing a file. The shell fails loudly if nothing matches.
+          uv run pytest tests/test_*_live.py \
             -q --no-header -p no:cacheprovider -p no:skipping
 
   image:
