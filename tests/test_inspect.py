@@ -34,6 +34,7 @@ HEALTH_ROW = (
             "processing": 1,
             "failed": 3,
             "oldest_ready_age_s": 900.0,
+            "max_recoveries": 2,
         }
     ],
     7,
@@ -336,6 +337,7 @@ def test_every_scalar_lands_in_its_own_field() -> None:
     ) == (7, 5, 0, 3, 11)
     assert got.server_time == NOW
     assert got.depths[0].queue_name == "triage"
+    assert got.depths[0].max_recoveries == 2
 
 
 def test_resubmit_carries_the_original_priority_and_the_dedup_key() -> None:

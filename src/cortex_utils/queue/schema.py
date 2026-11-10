@@ -35,6 +35,7 @@ from cortex_utils.queue.ops import (
     _tx,
     ensure_attempt_columns_not_null,
     ensure_claim_token_column,
+    ensure_recoveries_column,
     index_present,
 )
 from cortex_utils.queue.partitions import PartitionManager
@@ -52,6 +53,14 @@ REQUIRED_COLUMNS: dict[str, str] = {
     "status": "TEXT NOT NULL DEFAULT 'pending'",
     "priority": "INT NOT NULL DEFAULT 0",
     "attempts": "INT NOT NULL DEFAULT 0",
+    # Stale-claim recoveries, deliberately NOT attempts. A job that kills its
+    # worker outright never reaches fail_or_retry, so it cycles
+    # claim -> crash -> visibility reset -> claim with its budget intact. That
+    # is the right call for an expired token and the wrong one for a poison
+    # pill, and before this column nothing in the system counted the
+    # difference: no depth moved, health() showed nothing, and the only
+    # signature was worker churn.
+    "recoveries": "INT NOT NULL DEFAULT 0",
     "max_attempts": f"INT NOT NULL DEFAULT {DEFAULT_MAX_ATTEMPTS}",
     "last_error": "TEXT",
     "claimed_at": "TIMESTAMPTZ",
@@ -78,7 +87,7 @@ _RELKINDS = {
 
 # The columns ensure_queue_schema() can add to an existing table. Anything else
 # missing is refused rather than half-migrated.
-_MIGRATED_COLUMNS = frozenset({"next_attempt_at", "claimed_by"})
+_MIGRATED_COLUMNS = frozenset({"next_attempt_at", "claimed_by", "recoveries"})
 
 # How long a boot waits for the schema lock. Generous, because legitimate
 # contention here is a fleet redeploy -- but finite, because an indefinite fleet
@@ -410,8 +419,9 @@ def _ensure_queue_schema_locked(
         # one. A fresh database gets every column from queue_ddl() instead.
         add_retry_columns(conn, dry_run=False)
         ensure_claim_token_column(conn)
-        # The only one of the three that may decline -- it tightens a
-        # constraint rather than adding a column a query names.
+        ensure_recoveries_column(conn)
+        # The only one that may decline -- it tightens a constraint rather
+        # than adding a column a query names.
         ensure_attempt_columns_not_null(conn)
 
     result = ensure_queue_table(conn, extra_indexes=extra_indexes)

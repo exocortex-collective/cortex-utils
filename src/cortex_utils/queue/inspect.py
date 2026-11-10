@@ -68,6 +68,21 @@ class QueueDepth:
     failed: int
     oldest_ready_age_s: float | None
 
+    max_recoveries: int = 0
+    """The highest recovery count on any LIVE row in this queue.
+
+    A job that kills its worker never reaches fail_or_retry, so it returns to
+    pending with its attempts intact and can cycle forever. This is the number
+    that moves when that happens, and the only one that does -- depths stay
+    flat, because the row is pending again each time round.
+
+    Live rows only (pending or processing): a completed row recovered twice
+    survived a worker restart and finished, which is the mechanism working. A
+    single-digit value here is ordinary redeploy churn; a value that climbs on
+    one queue while its depths hold steady is a poison pill. Use stuck() to see
+    which row.
+    """
+
 
 @dataclass(frozen=True)
 class QueueHealth:
@@ -161,6 +176,12 @@ class StuckJob:
     claimed_at: datetime
     stuck_for_s: float
     attempts: int
+    recoveries: int = 0
+    """How many times this row has been recovered from a dead claimant.
+
+    High here with `attempts` low is the poison-pill signature: the work keeps
+    killing its worker, so it is never charged an attempt and never retires.
+    """
 
 
 @dataclass(frozen=True)
@@ -224,6 +245,11 @@ WITH depth AS (
         ) AS deferred,
         COUNT(*) FILTER (WHERE status = 'processing') AS processing,
         COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+        -- Free: this CTE already scans and groups. FILTERed to live rows
+        -- because a completed row's recoveries are history, not a loop.
+        COALESCE(MAX(recoveries) FILTER (
+            WHERE status IN ('pending', 'processing')
+        ), 0) AS max_recoveries,
         EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
@@ -367,6 +393,7 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
                 processing=d["processing"],
                 failed=d["failed"],
                 oldest_ready_age_s=d["oldest_ready_age_s"],
+                max_recoveries=d["max_recoveries"],
             )
             for d in depths
         ],
@@ -395,7 +422,7 @@ def stuck(
             """
             SELECT id, queue_name, claimed_by, claimed_at,
                    EXTRACT(EPOCH FROM (NOW() - claimed_at))::float8 AS stuck_for_s,
-                   attempts
+                   attempts, recoveries
             FROM queue
             WHERE status = 'processing'
               AND claimed_at < NOW() - (INTERVAL '1 minute' * %s)
