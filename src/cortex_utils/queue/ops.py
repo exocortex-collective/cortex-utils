@@ -334,6 +334,49 @@ def ensure_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
     return True
 
 
+def has_recoveries_column(conn: psycopg2.extensions.connection) -> bool:
+    """True if this schema's queue table already has recoveries.
+
+    Guarded like the other column probes: to_regclass returns NULL for a
+    missing table and `attrelid = NULL` matches nothing, so the answer for a
+    misconfigured search_path is False -- "the column is missing" rather than
+    "there is no table".
+    """
+    require_queue_table(conn)
+    with _tx(conn) as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = to_regclass('queue')
+              AND attname = 'recoveries'
+              AND NOT attisdropped
+            LIMIT 1
+            """
+        )
+        return cur.fetchone() is not None
+
+
+def ensure_recoveries_column(conn: psycopg2.extensions.connection) -> bool:
+    """Add recoveries if this schema predates recovery counting. True if added.
+
+    Same shape as ensure_claim_token_column, for the same reason: the ALTER
+    takes ACCESS EXCLUSIVE on a partitioned parent under live claim traffic,
+    and running it unconditionally would queue that lock behind real work on
+    every redeploy.
+
+    NOT NULL DEFAULT 0 rather than nullable, so every pre-existing row starts
+    at 0 and needs no backfill. Postgres 11+ stores a constant default in the
+    catalogue, so this does not rewrite the table.
+    """
+    if has_recoveries_column(conn):
+        return False
+
+    with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
+        cur.execute("ALTER TABLE queue ADD COLUMN IF NOT EXISTS recoveries INT NOT NULL DEFAULT 0")
+    log.info("Added queue.recoveries")
+    return True
+
+
 def nullable_attempt_columns(conn: psycopg2.extensions.connection) -> list[str]:
     """Which of attempts/max_attempts this schema's queue still allows NULL in.
 
@@ -946,7 +989,8 @@ def claim(
             """
             WITH reset_stale AS (
                 UPDATE queue
-                SET status = 'pending', claimed_at = NULL, claimed_by = NULL
+                SET status = 'pending', claimed_at = NULL, claimed_by = NULL,
+                    recoveries = COALESCE(recoveries, 0) + 1
                 WHERE queue_name = %(q)s AND status = 'processing'
                   AND claimed_at < NOW() - (INTERVAL '1 minute' * %(vis)s)
                   AND attempts < max_attempts

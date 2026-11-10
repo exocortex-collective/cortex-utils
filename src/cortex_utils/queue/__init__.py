@@ -42,9 +42,15 @@ from cortex_utils.queue.ops import (
 from cortex_utils.queue.ops import (
     ensure_claim_token_column as ensure_claim_token_column,
 )
+from cortex_utils.queue.ops import (
+    ensure_recoveries_column as ensure_recoveries_column,
+)
 from cortex_utils.queue.ops import fail_or_retry as fail_or_retry
 from cortex_utils.queue.ops import (
     has_claim_token_column as has_claim_token_column,
+)
+from cortex_utils.queue.ops import (
+    has_recoveries_column as has_recoveries_column,
 )
 from cortex_utils.queue.partitions import (
     PartitionError,

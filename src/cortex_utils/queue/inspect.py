@@ -68,6 +68,12 @@ class QueueDepth:
     failed: int
     oldest_ready_age_s: float | None
 
+    max_recoveries: int
+    """The highest recovery count on any live row (pending or processing).
+
+    How to read it against the depths: `docs/queue-api.md`, under claim().
+    """
+
 
 @dataclass(frozen=True)
 class QueueHealth:
@@ -161,6 +167,8 @@ class StuckJob:
     claimed_at: datetime
     stuck_for_s: float
     attempts: int
+    recoveries: int
+    """How many times this row has been recovered from a dead claimant."""
 
 
 @dataclass(frozen=True)
@@ -224,6 +232,11 @@ WITH depth AS (
         ) AS deferred,
         COUNT(*) FILTER (WHERE status = 'processing') AS processing,
         COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+        -- Free: this CTE already scans and groups. FILTERed to live rows
+        -- because a completed row's recoveries are history, not a loop.
+        COALESCE(MAX(recoveries) FILTER (
+            WHERE status IN ('pending', 'processing')
+        ), 0) AS max_recoveries,
         EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
@@ -367,6 +380,7 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
                 processing=d["processing"],
                 failed=d["failed"],
                 oldest_ready_age_s=d["oldest_ready_age_s"],
+                max_recoveries=d["max_recoveries"],
             )
             for d in depths
         ],
@@ -395,7 +409,7 @@ def stuck(
             """
             SELECT id, queue_name, claimed_by, claimed_at,
                    EXTRACT(EPOCH FROM (NOW() - claimed_at))::float8 AS stuck_for_s,
-                   attempts
+                   attempts, recoveries
             FROM queue
             WHERE status = 'processing'
               AND claimed_at < NOW() - (INTERVAL '1 minute' * %s)

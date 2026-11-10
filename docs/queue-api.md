@@ -143,10 +143,28 @@ burning three attempts on an outage that was never about the job.
 The cost, stated because it is real: a job that kills the worker for its *own*
 reasons — OOM, segfault, an unhandled crash — never reaches `fail_or_retry()`
 either. So it cycles claim → crash → recovery → claim indefinitely with its
-budget intact, and because `attempts` never increments, **nothing in the system
-counts the loop**. The only signature is worker churn. The older
-attempts-consuming semantics self-limited poison pills; this one does not.
-Tracked as cortex-wh3b.
+budget intact. The older attempts-consuming semantics self-limited poison
+pills; this one does not.
+
+The loop is **counted** instead. Each recovery increments `queue.recoveries`,
+which is deliberately not `attempts`: the budget still survives a dead
+claimant, but the cycling is not silent.
+
+| Where | What you see |
+|---|---|
+| `health().depths[].max_recoveries` | the worst live row per queue |
+| `stuck()[].recoveries` | the count for one specific row |
+
+Read them together with the depths. A few recoveries is ordinary redeploy
+churn — a worker stopped mid-job and the row came back. A count that climbs on
+one queue **while its depths stay flat** is a poison pill: the row is pending
+again after every crash, so no depth moves and nothing else in the system
+changes. `attempts` low with `recoveries` high is the signature.
+
+`release()` does **not** count as a recovery. Handing work back deliberately —
+auth is dead, a dependency is down, a deploy is stopping — is not a crash, and
+counting it would bury the signal under routine deploys. cryo hands rows back
+on every deploy stop, which is exactly the traffic that would have drowned it.
 
 ### `complete(conn, job_id, worker) -> bool`
 
@@ -466,8 +484,8 @@ One call, idempotent, cheap on the steady-state path — every step pre-checks t
 catalogue before touching anything, so a normal boot is a handful of reads and
 no locks.
 
-It runs the additive migrations first (`next_attempt_at`, `claimed_by`), then
-the shape check, then ensures `dead_letter`. **That order is the point.**
+It runs the additive migrations first (`next_attempt_at`, `claimed_by`,
+`recoveries`), then the shape check, then ensures `dead_letter`. **That order is the point.**
 `ensure_queue_table()` refuses to `ALTER` a live table, so reversed it would
 raise on exactly the deployments the additive migrations exist to bring
 forward. An old database is migrated; a new one is created complete.
