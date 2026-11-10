@@ -374,9 +374,9 @@ def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> lis
     fail loudly. This is a hardening of a bug that is latent on a table with no
     NULLs, so **any** database error is reported and skipped rather than
     crash-looping a fleet, and the next boot tries again. Catching a list of
-    the errors we thought of is not the same promise: NULL rows, a lock
-    timeout, and a deadlock (`deadlock_timeout` is 1s, so it fires BEFORE the
-    5s `lock_timeout`) are three ways this has actually been seen to fail.
+    the errors we thought of is not the same promise, and the list was wrong
+    twice: a deadlock reaches this before `lock_timeout` does, because
+    `deadlock_timeout` is the shorter of the two on a default server.
 
     The ALTER itself decides whether the column holds NULLs, because it scans
     under its own lock and no earlier answer can outlive it; the count is taken
@@ -400,7 +400,9 @@ def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> lis
             with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
                 cur.execute(f"SELECT count(*) FROM queue WHERE {column} IS NULL")
                 return int(cur.fetchone()[0])
-        except psycopg2.Error:
+        except psycopg2.Error as exc:
+            # pgcode only: see the blanket handler below on error text.
+            log.debug("Could not count NULLs", column=column, pgcode=exc.pgcode)
             return None
 
     tightened = []
@@ -421,14 +423,20 @@ def ensure_attempt_columns_not_null(conn: psycopg2.extensions.connection) -> lis
         except psycopg2.Error as exc:
             # Everything else, deliberately: a lock timeout, a deadlock, a
             # missing privilege. The column stays nullable, which is the state
-            # the rest of this package already tolerates, and the next boot
-            # tries again -- so there is nothing here worth a crash loop over.
+            # the rest of this package already tolerates.
+            #
+            # message_primary, not str(exc): a psycopg2 error's text includes
+            # the server's DETAIL and CONTEXT lines, and for some error classes
+            # those quote row values -- `Key (x)=(...) already exists`,
+            # `Failing row contains (...)`. This arm catches errors nobody
+            # enumerated, so it must not decide what their text may contain.
             log.warning(
                 "Could not tighten a queue attempt column",
                 column=column,
                 pgcode=exc.pgcode,
-                error=str(exc).strip()[:200],
-                hint="retried on the next boot",
+                error=(exc.diag.message_primary or "").strip()[:200],
+                hint="the column stays nullable; a later boot retries, though a "
+                "privilege or ownership problem will not clear on its own",
             )
         else:
             tightened.append(column)

@@ -118,9 +118,7 @@ def test_the_invariant_is_enforced_by_the_table_afterwards(legacy) -> None:
 
 
 def test_only_the_still_nullable_column_is_tightened(legacy) -> None:
-    """Half-migrated is a real state: the previous version of this function
-    altered both columns in one transaction, so one blocked column took its
-    neighbour down with it."""
+    """Half-migrated is a real state, and each column is tightened on its own."""
     with legacy.cursor() as cur:
         cur.execute("ALTER TABLE queue ALTER COLUMN attempts SET NOT NULL")
     legacy.commit()
@@ -131,9 +129,8 @@ def test_only_the_still_nullable_column_is_tightened(legacy) -> None:
 
 
 def test_a_null_row_blocks_only_its_own_column(legacy) -> None:
-    """The ALTER is the authority on NULLs, not a pre-count. A pre-count is a
-    guess another session can invalidate before the ALTER runs, and declining
-    on it left SET NOT NULL free to raise where nothing caught it."""
+    """The ALTER is the authority on NULLs: a count taken before it is a guess
+    another session can invalidate before it runs."""
     _insert(legacy, max_attempts=None)
 
     with structlog.testing.capture_logs() as logs:
@@ -142,14 +139,15 @@ def test_a_null_row_blocks_only_its_own_column(legacy) -> None:
     assert nullable_attempt_columns(legacy) == ["max_attempts"]
     warnings = _warnings(logs)
     assert len(warnings) == 1, warnings
-    assert (warnings[0]["column"], warnings[0]["nulls"]) == ("max_attempts", 1), (
-        "the column and the count are what an operator needs in order to backfill"
-    )
+    assert (warnings[0]["column"], warnings[0]["nulls"], warnings[0]["pgcode"]) == (
+        "max_attempts",
+        1,
+        "23502",
+    ), "the column, the count and the code are what an operator needs"
 
 
 def test_each_column_is_counted_separately(legacy) -> None:
-    """A constant, or the query pinned to one column name, survived while only
-    one column held exactly one NULL."""
+    """Each column's count must be its own."""
     _insert(legacy, attempts=None)
     _insert(legacy, max_attempts=None)
     _insert(legacy, max_attempts=None)
@@ -159,6 +157,53 @@ def test_each_column_is_counted_separately(legacy) -> None:
 
     counts = {w["column"]: w["nulls"] for w in _warnings(logs)}
     assert counts == {"attempts": 1, "max_attempts": 2}
+
+
+def test_a_count_it_cannot_run_reports_the_nulls_as_unknown(legacy) -> None:
+    """count_nulls exists to explain a failed ALTER, so its own failure must not
+    replace the error it is explaining.
+
+    Reachable without stubbing the count, which is the opposite of what I first
+    claimed: the ALTER needs ownership and the count needs SELECT, and an owner
+    can revoke SELECT from itself, so the two failures need nothing
+    contradictory. `attempts` is still tightened; `max_attempts` declines with
+    its NULL count unknown rather than crashing the boot.
+
+    Creates a role, so it needs a cluster you can throw away -- which is what
+    CORTEX_TEST_DSN is.
+    """
+    _insert(legacy, max_attempts=None)
+    role = "t_attempts_blind"
+    with legacy.cursor() as cur:
+        cur.execute(f"DROP ROLE IF EXISTS {role}")
+        cur.execute(f"CREATE ROLE {role}")
+        cur.execute(f"GRANT USAGE ON SCHEMA t_attempts TO {role}")
+        cur.execute(f"ALTER TABLE queue OWNER TO {role}")
+        cur.execute(
+            "SELECT inhrelid::regclass::text FROM pg_inherits "
+            "WHERE inhparent = to_regclass('queue')"
+        )
+        for (partition,) in cur.fetchall():
+            cur.execute(f"ALTER TABLE {partition} OWNER TO {role}")
+        # An owner's privileges are revocable from itself, which is the whole
+        # trick: ALTER still works, SELECT does not.
+        cur.execute(f"REVOKE SELECT ON queue FROM {role}")
+        cur.execute(f"SET ROLE {role}")
+    legacy.commit()
+    try:
+        with structlog.testing.capture_logs() as logs:
+            assert ensure_attempt_columns_not_null(legacy) == ["attempts"]
+        warnings = _warnings(logs)
+        assert [(w["column"], w["pgcode"], w["nulls"]) for w in warnings] == [
+            ("max_attempts", "23502", None)
+        ], warnings
+    finally:
+        with legacy.cursor() as cur:
+            cur.execute("RESET ROLE")
+            cur.execute(f"REASSIGN OWNED BY {role} TO CURRENT_USER")
+            cur.execute(f"DROP OWNED BY {role}")
+            cur.execute(f"DROP ROLE IF EXISTS {role}")
+        legacy.commit()
 
 
 def test_a_boot_against_null_rows_still_boots(legacy) -> None:
@@ -178,10 +223,9 @@ def test_a_held_lock_declines_rather_than_crashing_the_boot(legacy, monkeypatch)
     `statement_timeout` belongs to the test: without it, a regression that
     stopped `lock_timeout` applying would leave the ALTER waiting on a lock
     this same thread holds, so the test would HANG rather than fail -- there is
-    no pytest timeout, and a test that hangs reports nothing. Observed at 70s
-    during review, with the ALTER in wait_event Lock and the blocker idle in
-    transaction. With the bound, that regression cancels the statement and the
-    pgcode assertion below fails instead.
+    no pytest timeout, and a test that hangs reports nothing. With the bound,
+    that regression cancels the statement and the pgcode assertion below fails
+    instead.
     """
     monkeypatch.setattr(ops, "MIGRATION_LOCK_TIMEOUT_MS", 200)
     with legacy.cursor() as cur:
@@ -204,9 +248,8 @@ def test_a_held_lock_declines_rather_than_crashing_the_boot(legacy, monkeypatch)
         )
         warnings = _warnings(logs)
         assert [w["column"] for w in warnings] == ["attempts", "max_attempts"], warnings
-        # 55P03 is lock_not_available. Asserted as a code rather than as a
-        # message: it says the ALTER really lost the lock, where the prose
-        # would also pass for a statement cancelled by the bound above.
+        # 55P03 is lock_not_available. A statement cancelled by the bound
+        # above would log the same message under a different code.
         assert [w["pgcode"] for w in warnings] == ["55P03", "55P03"], warnings
     finally:
         blocker.rollback()
@@ -263,7 +306,6 @@ def test_the_null_fallback_is_the_default_not_an_excuse_to_retry(legacy) -> None
 
 
 def test_a_zero_max_attempts_row_is_retired_not_retried(legacy) -> None:
-    """`row[1] or DEFAULT_MAX_ATTEMPTS` read a legitimate 0 as "unset" and
-    granted the row three attempts. 0 means retire on the first failure."""
+    """0 means retire on the first failure, not "unset"."""
     job_id = _insert(legacy, max_attempts=0, status="processing", claimed_by="worker-a")
     assert fail_or_retry(legacy, job_id, "boom", "worker-a") == "failed"
