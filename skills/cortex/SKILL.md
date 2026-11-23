@@ -37,8 +37,9 @@ export CORTEX_GATEWAY_URL=http://localhost:8097  # Example
 # token. That includes the LAN, so it includes you unless you are running
 # inside cortex_default.
 #
-#   source ~/.cortex.env          # on Hades; defines CORTEX_API_TOKEN
-#   curl -H "Authorization: Bearer $CORTEX_API_TOKEN" http://10.5.2.21:8097/config
+#   CORTEX_API_TOKEN comes from the deployment's stack Env (see the
+#   deployment's own notes for where); never echo it.
+#   curl -H "Authorization: Bearer $CORTEX_API_TOKEN" "$CORTEX_GATEWAY_URL/config"
 #
 # Peer services and anything inside the compose network use
 # http://cortex-gateway:8080 and need no token. /health and /metrics stay
@@ -229,11 +230,12 @@ Triage rules configuration is managed via the Gateway REST API (not CLI).
 
 ### Update Config Workflow
 
-1. **Edit the rules YAML** at `~/cortex-config/rules.yaml` on Hades (or locally first)
+1. **Download and edit the active rules YAML** (`curl -H "Authorization: Bearer $CORTEX_API_TOKEN" "$CORTEX_GATEWAY_URL/config" > rules.yaml`).
+   Nothing is read from disk on the server; the config lives in Postgres.
 
 2. **Upload via API**:
 ```bash
-curl -X PUT http://10.5.2.21:8097/config \
+curl -X PUT "$CORTEX_GATEWAY_URL/config" \
   -H "Authorization: Bearer $CORTEX_API_TOKEN" \
   -H "Content-Type: text/plain" \
   -H "X-Created-By: your-name@context" \
@@ -241,14 +243,10 @@ curl -X PUT http://10.5.2.21:8097/config \
   --data-binary @/path/to/rules.yaml
 ```
 
-3. **Reload triage worker**:
+3. **No reload step.** The upload inserts a `config_reload` worker signal and the
+   triage worker reloads itself within ~30s. To confirm, on the deploy host:
 ```bash
-ssh devon@10.5.2.21 "docker kill -s SIGHUP cortex-triage-worker"
-```
-
-4. **Verify reload**:
-```bash
-ssh devon@10.5.2.21 "docker logs cortex-triage-worker 2>&1 | grep -E 'reload|version' | tail -3"
+docker logs cortex-triage-worker 2>&1 | grep -E 'reload|version' | tail -3
 ```
 
 ### Config API Endpoints
@@ -266,7 +264,7 @@ ssh devon@10.5.2.21 "docker logs cortex-triage-worker 2>&1 | grep -E 'reload|ver
 ### Validate Before Upload
 
 ```bash
-curl -X POST http://10.5.2.21:8097/config/validate \
+curl -X POST "$CORTEX_GATEWAY_URL/config/validate" \
   -H "Authorization: Bearer $CORTEX_API_TOKEN" \
   -H "Content-Type: text/plain" \
   --data-binary @/path/to/rules.yaml
